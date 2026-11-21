@@ -2148,6 +2148,43 @@ describe('图片默认种子（issue #22）', () => {
     await mountQoder(ctx, { regions: { cn: regionConfig, global: { pat: '' } } })
     await waitFor(() => routes.some(r => r.path.includes('/usage')))
     const usage = routes.find(r => r.path.includes('/usage'))!
+    // **必须等目录真的从上游装进来，不能只等 `/usage` 路由注册。**
+    //
+    // 启动时的 `refreshModels` 是 fire-and-forget（`void`），`/usage` 路由在它
+    // 之前就注册好了。此前这里只等路由，于是「目录已到位」是**碰运气**：目录拉
+    // 得快就通过，拉得慢就读到静态兜底 `QODER_FALLBACK_MODELS`（14 条，`cn` 过滤
+    // 后 9 条），断言 `toEqual` 三行模型直接崩。
+    //
+    // 1.28.0 加了 `discoverNodes()`（一次额外的 `/region/endpoints` 往返）之后，
+    // 这个竞态从「偶发」变成「Windows CI 必崩、本机时快时慢」——它不是新 bug，
+    // 是这条测试一直存在的运气成分被拉长了。修法不是把断言放宽成「包含这三条」
+    // （那会漏掉「多出别的模型」这类真回归），而是**等条件成立**：等到桩里的
+    // `LIVE_CHAT` 那三个 key 出现在运行期目录里。
+    //
+    // 读法用卡片同一条路径（`/usage`），所以等的是「卡片能看见的目录」到位，
+    // 而不是某个内部变量。
+    const liveKeys = LIVE_CHAT.map(m => m.key)
+    const readUsageDoc = async (): Promise<{ models?: Array<{ key: string }> }> => {
+      const probe = fakeResponse()
+      await usage.handler({ method: 'GET', url: `${usage.path}?region=cn`, headers: {} }, probe.node)
+      return JSON.parse(String(probe.body() ?? '{}')) as { models?: Array<{ key: string }> }
+    }
+    // 判据是「目录**恰好**等于桩里那三条」，不是「包含那三个 key」。
+    //
+    // 第一版写成 `every(k => keys.includes(k))`，结果**恒真、轮询直接跳过**：
+    // 兜底表 `QODER_FALLBACK_MODELS` 经 `cn` 过滤后那 9 条里恰好也含
+    // `qmodel_38max` / `qfmodel` / `kmodel` —— 于是「还没换上游目录」和「已经
+    // 换成上游目录」被判成同一件事，测试又回到碰运气。
+    // 桩只返回三条，所以「长度与内容都一致」才是「目录已换成上游那三条」。
+    const startedAt = Date.now()
+    for (;;) {
+      const keys = ((await readUsageDoc()).models ?? []).map(m => m.key)
+      if (keys.length === liveKeys.length && liveKeys.every((k, i) => keys[i] === k)) break
+      if (Date.now() - startedAt > 10_000) {
+        throw new Error(`目录一直没换成上游那三条，当前 key：${keys.join(',') || '(空)'}`)
+      }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
     const res = fakeResponse()
     await usage.handler({ method: 'GET', url: `${usage.path}?region=cn`, headers: {} }, res.node)
     const doc = JSON.parse(String(res.body())) as {
