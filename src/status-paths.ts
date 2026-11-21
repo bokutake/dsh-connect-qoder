@@ -60,8 +60,13 @@ export const QODER_ACCOUNT_CREDITS_PATH = '/plugins/dsh-connect-qoder/account-cr
  * — the model section and the account pool — and a second copy of a URL is a
  * second thing to forget when it moves. Node-free and side-effect free, so it
  * costs nothing on the Host side either.
+ *
+ * **指向本分叉，不是上游**：这个链接是给用户点「项目主页 / 反馈问题」用的，
+ * 指到已停止维护的上游只会让人把 issue 提给一个不再看的仓库。上游地址仍然
+ * 保留在 README 与 `LICENSE-MODIFICATIONS.md` 里（署名与来源要留），只是
+ * 不复用这个「当前项目」常量。
  */
-export const QODER_GITHUB_URL = 'https://github.com/dingminhua/dsh-connect-qoder'
+export const QODER_GITHUB_URL = 'https://github.com/bokutake/dsh-connect-qoder'
 
 /**
  * 创建 PAT 的逐步指南。挂在「添加 PAT」弹窗里而不是页脚：用户打开那个弹窗的

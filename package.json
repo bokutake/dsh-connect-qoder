@@ -1,10 +1,13 @@
 {
-  "name": "@dmh2002/dsh-connect-qoder",
+  "name": "@bokutake/dsh-connect-qoder",
   "displayName": "DSH Connect Qoder",
-  "description": "把 Qoder（通义灵码国内版 / 国际版）接入 DeepSeek Harness：PAT 多账号池、每日签到、积分读数与模型管理。",
-  "version": "1.27.1",
-  "author": "dingminhua",
-  "copyright": "Copyright (c) 2026 LaoDing",
+  "description": "把 Qoder（通义灵码国内版 / 国际版）接入 DeepSeek Harness：PAT 多账号池、每日签到、积分读数与模型管理。（dingminhua/dsh-connect-qoder 的独立维护分叉）",
+  "version": "1.28.0",
+  "author": "bokutake <i@html.moe>",
+  "contributors": [
+    "dingminhua (upstream author, https://github.com/dingminhua/dsh-connect-qoder)"
+  ],
+  "copyright": "Copyright (c) 2026 LaoDing (upstream); modifications Copyright (c) 2026 bokutake",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",
@@ -56,11 +59,13 @@
     "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.md",
     "LICENSE",
+    "LICENSE-MODIFICATIONS.md",
     "docs/DSH-0.2.1-RC1-FOLLOWUP.md",
     "docs/DSH-0.2.2-RC1-FOLLOWUP.md",
     "docs/DSH-0.2.2-RC2-FOLLOWUP.md",
     "docs/DSH-0.2.2-RC3-FOLLOWUP.md",
-    "docs/DSH-0.2.2-RC5-FOLLOWUP.md"
+    "docs/DSH-0.2.2-RC5-FOLLOWUP.md",
+    "docs/issues/magpie-330-billing-count.md"
   ],
   "scripts": {
     "prepack": "npm run build",
@@ -91,11 +96,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dingminhua/dsh-connect-qoder.git"
+    "url": "git+https://github.com/bokutake/dsh-connect-qoder.git"
   },
-  "homepage": "https://github.com/dingminhua/dsh-connect-qoder#readme",
+  "homepage": "https://github.com/bokutake/dsh-connect-qoder#readme",
   "bugs": {
-    "url": "https://github.com/dingminhua/dsh-connect-qoder/issues"
+    "url": "https://github.com/bokutake/dsh-connect-qoder/issues"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1-rc.1 <5.0.0 || >=4.0.2 <5.0.0",

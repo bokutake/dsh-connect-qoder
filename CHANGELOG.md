@@ -2,12 +2,200 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.28.0 (2026-11-21)
+
+> **对齐官方 CLI：`business` 记录按轮归并、补上 `business/finish` 闭合、请求头与设备身份
+> 取值纠正、客户端版本集中解析。** 一条静默故障的排查：**Qoder 计费控制台里本插件一条
+> 逐模型消费行都没有，而官方 Web 客户端每轮都有一行。** 对话完全正常，缺的只是服务端
+> 记账 —— 这类缺陷不报错，只能对着真实客户端逐字段、逐请求头比。
+>
+> 依据分两层，缺一不可：**静态**（本机 CLI 的 Bun 单文件可执行程序解出 JS 后按符号名
+> 定位 `Mh` / `Fz` / `kVe` / `changeBusinessState` / `Qd.finish`）与**动态**（对官方 CN
+> CLI 1.1.94 做 MITM 抓包，两次共 80 个请求逐条比对请求头、bearer 载荷与闭合 body）。
+> 静态只能给出「字段该长什么样」，给不出「什么时候发、发几次」。
+>
+> 本轮从 `1.27.1` 继续维护。上游仓库已于
+> [issue #49](https://github.com/dingminhua/dsh-connect-qoder/issues/49) 公告停止维护
+> （理由是官方取消免费用户每日签到），而本插件在**记账与设备身份**这一侧的缺陷与该公告
+> 无关，仍在修。**本版本的维护仓库是
+> [bokutake/dsh-connect-qoder](https://github.com/bokutake/dsh-connect-qoder)。**
+
+### 变更：npm 包名换成自己的 scope
+
+**发布名从 `@dmh2002/dsh-connect-qoder` 改为
+[`@bokutake/dsh-connect-qoder`](https://www.npmjs.com/package/@bokutake/dsh-connect-qoder)。**
+本仓库是独立分叉，不能也不该往别人的 scope 下发版。升级方式：
+
+```bash
+dsh plugin remove @dmh2002/dsh-connect-qoder    # 卸掉旧包
+dsh plugin add @bokutake/dsh-connect-qoder      # 装新包
+```
+
+**配置不会丢**：`cordis.patch.yml` 的 entry id、设置命名空间、`/plugins/dsh-connect-qoder/…`
+路由与 CLI 程序名**故意保持不带作用域**（改名会孤儿化老配置），所以账号池、积分缓存、
+模型勾选都还在。只有 npm 侧的包名变了。
+
+> 两个包**可以并存**（它们是不同的包名），但同时启用会让同一个 provider 注册两次。
+> 换装请先卸旧的。
+
+### 修复
+
+- **`business` 记录改为「一条用户输入一条记录」，并补上轮次闭合（控制台无消费行的直接原因）。**
+  - **现场**：同一账号同一时段，官方 Web 客户端每轮落一行逐模型消费，本插件**一行都没有**；
+    对话与计费功能本身都正常。
+  - **根因有两半**：① `business.id` 的粒度一直错；② 每轮结束时**从不闭合**。
+  - **粒度的两次错法（都记下来，别再走回去）**：最初 `id` 与 `request_id` 一样每轮
+    `randomId()`，一场会话被记成 N 条互不相干、且**每条都没有结束事件**的记录；随后改成
+    **整场会话固定**（钉在 `session_id` 上），第 2、3 轮就复用第 1 轮的 id，服务端把整场
+    记成**一条**永不闭合的记录 —— 同样出不了逐轮消费行，只是晚一轮才发作。
+  - **正确粒度**：客户端 `Mh.create(sessionId, …, userMessage.requestSetId, …)` 把
+    `business.id` 直接取成**那条用户消息的 `requestSetId`**（`Fz` 的
+    `id: o || randomUUID()`）。所以是一条用户输入一条记录，**一条输入之后那串工具循环里的
+    N 次补全共用同一个 id**。
+  - **改法**：键为「会话 + 本轮用户提示」，并在闭合时**把记录从表里删掉** —— 同一轮的工具
+    循环提示不变，命中同一条；下一轮用户输入必然不同（连说两遍「继续」也成立，因为上一轮
+    已删），必然新建。
+  - **抓包核对**：一轮 1 次补全 → 1 次闭合；一轮 2 次补全（含 1 次 `Bash` 工具调用）→
+    **仍然 1 次闭合**；补全请求体从 155 648 B 涨到 157 648 B（工具结果在轮内累积），
+    闭合次数不变。
+  - 同时补齐 `product` / `type` / `version` / `stage` / `model_key` 五个字段；`stage` 按
+    客户端 `changeBusinessState()` 推进（`init`/首次 → `start` → `processing`）。
+- **新增 `POST /algo/api/v2/service/business/finish`（此前从未发过）。**
+  - 不发它，服务端只能等 TTL 释放租约，那一轮在记账上永远是「进行中」。
+  - 形状逐字照抄客户端 `Qd.finish()`，终态按 `kVe()`：`abort` /
+    `repeated_tool_call_denied` → `abort`，`error` / `max_turns` → `error`，其余
+    （含 `end_turn`）→ `complete`。
+  - **请求体是 `{payload, encodeVersion}` 双层信封，不是 business 对象本身**：`payload`
+    的值是**字符串**。这一层最容易漏 —— 第一版没包，真实上游回 **HTTP 500**，而对假上游的
+    单测是绿的（假上游只解一层就当作对了）。实测证据：解出的 CLI 闭合明文 522 B，逐字是
+    `{"payload":"{\"event_time\":…}","encodeVersion":"1"}`。
+  - **`sub_task` / `orphan` / `feature_switches` 刻意不发**（不是漏了）：它们在主对话里
+    本来就是 `undefined`，官方 CLI 的明文里没有这三个键（`business` 恰好九个）。
+  - 三道闸照抄客户端的守卫：没有 `business.id` 不发、无法归组不发、同一轮已闭合不发
+    （幂等键是 `business.id`）。
+  - **不阻塞用户**：闭合在 `res.end()` 之后、排到下一轮事件循环执行，失败只记日志。
+- **`cosy-clienttype` 从 `10` 改回 `5`。** `10` 是**桌面 App 通道**的值：官方 CN CLI 在
+  105 个请求里 `cosy-clienttype` **全部是 `5`**，一次 `10` 都没有，而它的目录里 13 个模型
+  一个不少。`10` 当初解决的问题（旧版本号导致目录缩水）的真解是**把版本号提上去**。
+- **`cosy-business-product` 从 `ide` 改为 `cli`。** 这个头每次业务请求都带，值就是 `cli`；
+  `ide` 是早期从网页版抄来的假设。
+- **`user-agent` 从 `Go-http-client/2.0` 改为 `Bun/1.4.4`。** 官方 CLI 是 Bun 编译的单文件
+  可执行程序，抓包 41/41 个请求都是这个值。**它是常量，刻意不跟随 `cosy-version`** ——
+  `1.4.4` 是 Bun 运行时的版本，跟着走会发出从未存在过的 `Bun/1.1.94`。
+- **`cosy-version` 不再写死，改为与 bearer 载荷 `cosyVersion` 同源。** 抓包里这两处逐字
+  相同，`business.version` 也是同一个值，三处同源所以只留一个入口（新增
+  `src/client-version.ts`）：用户显式配置 → Qoder releases 接口的最新 CLI 版本 → 内置
+  兜底 `1.1.94`。**只升不降**（版本号回退在服务端眼里同样是异常行为），且**不编造版本号**
+  （一个不存在的版本比一个「旧但真实」的版本更显眼）。
+- **设备身份改为默认取本机真实值，且 `machineId` 与 `machineToken` 分开取。**
+  - 抓包事实：`cosy-machineid` 是一个 UUID（= `~/.qoder-cn/.auth/machine_id`），
+    `cosy-machinetoken` 是 88 字符的独立令牌（来自桌面客户端的 UMID 组件），**两者不同值**。
+    此前两个都由 PAT 摘要派生：取值确实不同，但**都不是真实值**。
+  - 更糟的是**自相矛盾**：签到 / 额度路径本来就用真实 UMID 组件（`device-risk.ts`），
+    只有聊天路径用派生值 —— 同一个账号、同一个进程对上游呈现两套设备身份。
+  - **改法**：新增 `src/device-identity.ts`，三档来源 `real`（默认）/ `derived`（1.27.x
+    旧行为）/ `manual`。`real` 下取不到就**逐字段退回派生值并把原因写进日志**（静默降级会
+    让「为什么身份和签到路径不一样」查不出来）。
+  - **补齐 `cosy-machinecode` / `cosy-machineos` / `cosy-machinehostname`**：官方每个聊天
+    请求都带，此前一个都没发。
+  - `manual` 档**默认关、不给 UI 入口**：填别人的真实指纹等于伪造设备身份，填不存在的值比
+    填旧值更容易被筛出来。配置项在顶层（`deviceIdentity` / `identityOverride`），不是区域级
+    —— 它是整机属性。
+- **`session_type` 按区域取值：国内版 `qoderclicn`、国际版 `qodercli`。** 此前写死
+  `'qodercli'`，于是国内版请求一直带着国际版的会话类型（客户端 `SPr`）。
+- **每个请求都下发 `parameters.max_tokens`（此前从不发）。** 客户端无条件写它；不发等于让
+  上游自己挑默认值，用户在设置里选的输出预算对上游完全不可见。三层取值：调用方给的（来自
+  `/model/list`）→ 兜底 32 768（= 客户端 `defaultTokens: 32e3`）→ 被「学到的上限」夹一下。
+  上限是**学来的不是猜的**（从上游报错 `Range of max_tokens should be [1, N]` 里读），
+  绝不猜一个更小的值 —— 猜小会让回答被静默截断。
+
+### 新增
+
+- **区域节点发现与 inference 节点轮换**（思路来自 `simonsmh/pi-provider-qoder`，**字段名以
+  真实客户端为准**）。拉 `/api/v3/service/region/endpoints`，缓存 5 分钟；**不认
+  `dataNodeMap.remote_agent`**（pi 假设了这个字段，真实响应里没有它）；发现失败绝不挡聊天；
+  选举节点网络层不可达时回退默认网关重发一次（HTTP 4xx/5xx 与用户取消都不重发 —— 换节点
+  重发只会把同一个错误再问一遍，还可能把一次配额错误放大成两次计费）。节点表按实例缓存、
+  不共享：它是按账号下发的。
+- **`cache_control: {type:'ephemeral'}` 标记（默认关，可配）**（思路来自 magpie，语义按
+  客户端）。位置是**最后一条 system 消息的最后一个非空文本 block**，不是「最后一个 user
+  轮」。默认必须关：客户端只在模型声明 `capabilities.cacheControl` 时才开，而那条路径只
+  服务自定义 provider；Qoder 内建通道的缓存由服务端按 `session_id` 自动做（issue #42
+  实测命中 99.8%）。
+
+### 实测验证
+
+改完之后，用**插件代码本身**（同一条 `chatStream` + `finishTurn` 路径）、真实 CN 凭据、
+模型 `dfmodel`，经 MITM 代理打真实上游，再与官方 CLI 的抓包逐头逐字段比对：
+
+| 项 | 官方 CLI 1.1.94 | 插件实测 |
+| --- | --- | --- |
+| `cosy-clienttype` / `cosy-business-product` / `-type` / `cosy-scene` | `5` / `cli` / `agent` / `assistant` | 逐字相同 |
+| `cosy-version` / `user-agent` | `1.1.94` / `Bun/1.4.4` | 逐字相同 |
+| `cosy-machineid` / `-token` / `-type` / `-code` / `-hostname` / `-os` | 各有值 | **全部相同**，且 `machineid ≠ machinetoken` |
+| `business/finish` 明文 | 522 B，`{payload, encodeVersion}` | 结构逐字段相同 |
+| `business/finish` 响应 | 7 B（成功） | `success` |
+
+唯一差异是 `sec-fetch-mode: cors`：那是 Node 的 `fetch`（undici）自己加的头，不是插件
+代码写的，也不带业务语义。
+
+**计费台账侧**：闭合生效后，Qoder 控制台开始出现逐条消费行，时间戳与抓包逐条对得上
+（含一次修复前的 HTTP 500 尝试与随后数次 `success`）。
+
+### 与 magpie `plugins/issues/330` 的关系
+
+那次 issue 的 claim 是「一次 DSH 任务 265 次请求后触发 `Billing daily count exceeded`，
+怀疑每条请求都被记成一次新对话」。本改动与它指向同一根因，但修在更深的一层：它的假设停在
+「计数单位」（我们按轮归并，与 magpie 0.2.31 的做法一致），而**更根本的是每条记录都没
+闭合** —— 服务端只能等 TTL 释放租约与日计数。magpie 至今不发 `finish`，靠服务端 TTL
+兜底；我们两环都补了。详细对照见
+[`docs/issues/magpie-330-billing-count.md`](docs/issues/magpie-330-billing-count.md)。
+
+### 明确未验证
+
+- **`Billing daily count exceeded` 是否不再出现，本轮没有验证。** 那个报错是**日累计**
+  触发的，需要跑到当日上限才会重现；验证期间只跑了 4 轮，远不到上限。本机控制台也**没有
+  暴露日计数**（只有逐条消费行），所以连间接读数都没有。「不再撞墙」是从根因推出的结论，
+  **不是直接观测** —— 推论方向清楚，但仍属推论。
+- **`ask/finish`（`POST /api/v2/service/ask/finish`）不动**：它与 `business/finish` 是两个
+  端点，抓包里从未出现（官方 CLI 走 `agent_chat_generation` 链路时不发它）。
+- **`_isSubagent` 那一支不实现**：本插件没有子 agent 概念，客户端 `finalize()` 在子 agent
+  上直接 return。
+
+### 测试
+
+- 新增 `tests/business-finish.spec.ts`（8 条）：闭合 body 的信封与字段形状、
+  `end_at > begin_at`、幂等、`kVe` 三支映射、**`business` 恰好九个键**、缺 id 时不发、
+  闭合失败不抛。
+- 新增 `tests/device-identity.spec.ts`（11 条）：`real` 下两个身份字段来源确实不同、
+  UMID 缺失时逐字段降级且原因可见、`derived` 不碰 UMID、`manual` 空字段各自退回。
+- 新增 `tests/client-version.spec.ts`（15 条）：版本比较、releases 两种响应形状、只升不降、
+  override 取代自动发现、并发 refresh 只打一次、TTL 与缓存损坏兜底。
+- 新增 `tests/header-conformance.spec.ts`（6 条）：五个头逐字对照抓包值、`cosy-version`
+  与 bearer 载荷逐字相同、注入版本三处同值、**`user-agent` 不跟随 `clientVersion`**、
+  设备身份六件套齐全。
+- 新增 `tests/endpoints.spec.ts`（13 条）、`tests/cache-control.spec.ts`（6 条）。
+- `tests/upstream.spec.ts`：`business.id` 那条再次翻转（`toBe` → `not.toBe`）并新增
+  「同一轮多次补全共用同一个 id」；协议版本三条改为断言 `clienttype 5` 与「三个请求头
+  同值」，不再钉死一个会漂移的版本号。
+- `tests/chat-body-conformance.spec.ts`：`stage` 推进那条改成**同一轮内**连发三次（此前
+  每轮换一句提示，靠「整场会话共用一条记录」才看得出推进）。
+- **改正两条把 bug 钉成正确行为的断言**：`business.id` 先被断言「每轮不同」，又被改成
+  「整场相同」；`stage` 那条的夹具掩盖了「换提示就是换轮次」。
+- **`tests/privacy.spec.ts` 补一条规则 + 一条规则自测（29 条）**：原规则只认
+  `machineId: "…"` 的赋值写法，抓不到 `| cosy-machineid | <值> |` 这种**表格**形态 ——
+  而本轮的真实泄露恰恰发生在表格里。新增规则并把那次的两种形态钉成规则自测。
+- 回归：`pnpm run check` 全绿，**1588 通过 / 18 跳过**（比 1.27.1 多 75 条）；
+  `pnpm vitest run tests/privacy.spec.ts` 29 条通过；
+  `npm pack --dry-run` 清单里没有 `tests/`、`scripts/`、`docs/audit/`。
+
 ## 1.27.1 (2026-11-20)
 
 > **修 issue #48：上游 `code 147`（付费资源包余额不足）被误判成凭据失效，界面显示
 > 「API 密钥无效」，实际是 `qfmodel` 的专属资源包花完了。** 与 11-18 采纳 `144` 的
 > issue #45 完全同型 —— `147` 的 `message` 与 `144` 一字不差，只差 `modelKey` 与
 > `subCode`。码表漏一行，patch 版本。
+
 
 ### 修复
 

@@ -3,18 +3,24 @@
 > 本文档是 `dsh-connect-qoder` 的**唯一权威发布流程**。发布前请通读一遍。
 >
 > 🤖 **由 AI 助手代跑发布时，请先读 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md)**：
-> 其中 §1 记着一条硬规矩 —— **`npm login` 与 `npm publish` 交给用户在自己的交互式终端执行，
-> AI 不要代跑**。0.4.3 发布当天 AI 试了 4 次全部失败（含用 `script` 伪造 pty），原因是 npm 的
-> 2FA 授权窗口**只有约 5 分钟**，人工往返转述链接赶不上；用户在自己终端跑的那一次 **49 秒**完成。
-> 该文档还记着发布状态的三态判别、`prepack` 会重新构建、以及核验产物的实操坑。
+> 其中 §1 记着一条硬规矩 —— **`npm stage approve`（要 2FA 的那一步）交给用户自己跑，
+> AI 不要代跑**。旧流程（直接 `npm publish`）时代 AI 试了 4 次全部失败（含用 `script` 伪造
+> pty），原因是 npm 的 2FA 授权窗口**只有约 5 分钟**，人工往返转述链接赶不上；用户在自己
+> 终端跑的那一次 **49 秒**完成。
+>
+> **2026-11-21 起改用 staged 发布**：`npm stage publish`（上传，**不需要 2FA**）与
+> `npm stage approve`（批准，**需要 2FA**）拆成两步。上传那一步 AI 可以代跑，批准那一步
+> 由维护者跑 —— 而且它没有轮询窗口，失败可原地重试。详见 §6 与 §7。
 
 ## 前置条件
 
-- npm 已登录：`npm whoami` 应显示 `dmh2002`（若报 `need auth`，先 `npm login`）。**发布前务必重新敲一次**：token 会在后台被作废，1.3.0 发布前它就已是 401，而 1.2.1 七小时前还用同一枚发成功（见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §9.1）。
-- 账号若开启 2FA（两步验证）：`npm publish` 时需**在浏览器确认一步**（见第 7 步）。**这一步请在
-  自己的交互式终端里做**，理由见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §1。
-- GitHub 仓库：`https://github.com/dingminhua/dsh-connect-qoder`（默认分支 `main`）。
-- `gh` 已登录且带 `repo` 权限：`gh auth status` 应显示 `Logged in to github.com account dingminhua`、scope 含 `repo`（第 9 步要用）。
+- npm 已登录：`npm whoami` 应显示 `bokutake`（若报 `need auth`，先 `npm login`）。**发布前务必重新敲一次**：token 会在后台被作废，1.3.0 发布前它就已是 401，而 1.2.1 七小时前还用同一枚发成功（见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §9.1）。
+- 账号**必须**开启 2FA：npm 已不再允许无 2FA 发布（2026-11-21 实测 `npm publish` 直接回
+  `E403 Two-factor authentication … is required`）。staged 流程下，2FA 只在**批准**那一步
+  出示（见 §7），**这一步请在自己的交互式终端里做**。
+- GitHub 仓库：`https://github.com/bokutake/dsh-connect-qoder`（默认分支 `main`）。
+  上游是 `dingminhua/dsh-connect-qoder`，已停止维护，不再是发布目标。
+- `gh` 已登录且带 `repo` 权限：`gh auth status` 应显示 `Logged in to github.com account bokutake`、scope 含 `repo`（第 9 步要用）。
 
 ## 每次发布的完整步骤
 
@@ -160,74 +166,159 @@ gh run view <run-id> --json conclusion,jobs -q '.conclusion as $c | "OVERALL: \(
 
 > **为什么这一条要写进清单**：0.4.0 发布时 CI 已经连红 6 次 —— `tests/accounts.spec.ts` 断言保险库文件 `mode === 0o600`，而 node 在 Windows 上只把「只读」一位映射进 `st_mode`，普通文件一律报 `0o666`，**这条断言从被引入那天起就没在 Windows 上绿过**。它伤不到用户（写入路径确实请求了 0600），但红着的 CI 让「这次发布有没有弄坏什么」这个问题失去答案：真回归会混在既有红灯里看不见。修法见 CHANGELOG 的 0.4.1。
 
-### 6. 发布到 npm
+### 6. 发布到 npm（**staged：分两步，2FA 只在第二次**）
 
-```bash
-npm publish
+**不要用 `npm publish`。** npm 现在对开启 2FA 的账号要求「发布时当场出示 2FA」，而
+`npm publish` 的那次出示发生在**上传之前**、且必须在同一个交互式会话里完成 —— 一旦
+stdout 不是 TTY（管道、重定向、后台任务、CI、agent 的 shell），npm 会印出被遮蔽的授权
+链接并立刻退出，这条链路**必然赶不上**（实测见 §7 与 `docs/RELEASE_EXPERIENCE.md` §1）。
+
+2026-11-21 实测：即使在本机交互式终端里跑 `npm publish`，也会被直接拒掉 ——
+
+```
+npm error code E403
+npm error 403 Forbidden - PUT https://registry.npmjs.org/@bokutake%2Fdsh-connect-qoder
+npm error - Two-factor authentication or granular access token with bypass 2fa enabled
+npm error   is required to publish packages.
 ```
 
-> ⚠️ **`npm publish` 成功退出（exit 0）不等于版本已上线。** 本账号/包可能走 npm 的**暂存发布（staged publishing）**：此时 registry 返回 **`202 Accepted`**，npm 把它当成功（打印 `info ok`、退出码 0），但版本只是进了**暂存区**，**公开的 packument 里看不到**，用户也装不到。
->
-> **判据**：`npm publish` 只报 `PUT 202` / `info ok`（**没有** `+ @dmh2002/dsh-connect-qoder@X.Y.Z` 那一行），且第 8 步直连核验里 `latest` 仍是旧版本 —— 那就是**待批准**，不是失败。
->
-> **必须再由维护者用 2FA 批准**：到 npmjs.com 的 **Staged Packages** 标签页点 **Approve**；或在 npm CLI **≥ 11.15.0** 下用 `npm stage approve <stage-id>`。
+改成 **staged publishing**：先把 tarball 传进暂存区（**不需要 2FA**），再由人用一次
+2FA 批准。2FA 从「上传流程的一部分」变成「最后一道独立确认」。
 
-**作用域包**：`package.json` 的 `name` 是 `@dmh2002/dsh-connect-qoder`，且带 `publishConfig.access: "public"`——**没有这一项，`npm publish` 会按 restricted 报价并可能失败**。发布名与插件在 DSH 内的标识是两件事：`cordis.patch.yml` 的 entry `id`、设置命名空间、`/plugins/dsh-connect-qoder/…` 路由与 CLI 程序名**故意保持不带作用域**（改名会孤儿化老配置）。
+```bash
+# ① 暂存（不需要 2FA，可在任意 shell 里跑）
+npm stage publish --access public
 
-**打包内容**：`package.json` 的 `files` 字段限定只发布 `lib/`、`icons/`、`docs/assets/`、`docs/PAT.md`、`docs/PRIVACY.md`、`docs/DESIGN.md`、`docs/PROMO_BADGE.md`、`docs/DSH-0.2.1-RC1-FOLLOWUP.md`、`docs/DSH-0.2.2-RC1-FOLLOWUP.md`、`docs/DSH-0.2.2-RC2-FOLLOWUP.md`、`docs/DSH-0.2.2-RC3-FOLLOWUP.md`、`docs/DSH-0.2.2-RC5-FOLLOWUP.md`、`screenshots.json`、`cordis.patch.yml`、README 双语、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`LICENSE`。`tests/`、`scripts/`、`docs/audit/` 与 `node_modules/` 不会进入发布包——`npm pack --dry-run` 的输出里若出现它们（或任何 `pt-` 样式的字符串），先修再发。
+# ② 查看暂存了什么，拿到 stage-id
+npm stage list
+npm stage view <stage-id>          # 可选：核对 tarball 内容与版本
+
+# ③ 批准（**这一步要 2FA**，在你的交互式终端里跑）
+npm stage approve <stage-id>       # 会提示输入 6 位 OTP
+```
+
+> **`--otp` 在 `approve` 上是允许的**：`npm stage approve --otp <6位>`。这与旧文
+> §7「不要用 `--otp`」不冲突 —— 那一条针对的是 `npm publish` 的**浏览器回调**流程
+> （轮询 `/-/v1/done?authId=…`，约 4.6 分钟超时）。`approve` 只是提交一个码，没有轮询
+> 窗口，所以两种方式都可以。
+
+> **`npm stage publish` 退出码 0 ≠ 已上线。** 版本只是进了暂存区，公开 packument 里
+> 看不到，用户也装不到。必须完成 ③。
+
+> **拒掉重来**：`npm stage reject <stage-id>`。被 reject 的版本**没有占用版本号**，
+> 修完可以直接重新 `npm stage publish`，不需要改版本号。
+
+**作用域包**：`package.json` 的 `name` 是 `@bokutake/dsh-connect-qoder`（本仓库是独立
+分叉，已从上游的 `@dmh2002/` 换到自己的 scope），且带 `publishConfig.access: "public"`
+——**没有这一项，发布会被按 restricted 处理并可能失败**，所以 `npm stage publish` 也显式
+带 `--access public`。发布名与插件在 DSH 内的标识是两件事：`cordis.patch.yml` 的 entry
+`id`、设置命名空间、`/plugins/dsh-connect-qoder/…` 路由与 CLI 程序名**故意保持不带作用域**
+（改名会孤儿化老配置）。
+
+**打包内容**：`package.json` 的 `files` 字段限定只发布 `lib/`、`icons/`、`docs/assets/`、
+`docs/PAT.md`、`docs/PRIVACY.md`、`docs/DESIGN.md`、`docs/PROMO_BADGE.md`、
+`docs/DSH-0.2.1-RC1-FOLLOWUP.md`、`docs/DSH-0.2.2-RC1-FOLLOWUP.md`、
+`docs/DSH-0.2.2-RC2-FOLLOWUP.md`、`docs/DSH-0.2.2-RC3-FOLLOWUP.md`、
+`docs/DSH-0.2.2-RC5-FOLLOWUP.md`、`docs/issues/magpie-330-billing-count.md`、
+`screenshots.json`、`cordis.patch.yml`、README 双语、`CHANGELOG.md`、
+`THIRD_PARTY_NOTICES.md`、`LICENSE`、`LICENSE-MODIFICATIONS.md`。
+`tests/`、`scripts/`、`docs/audit/`、`docs/issues/upstream-announcement-draft.md` 与
+`node_modules/` 不会进入发布包——`npm pack --dry-run` 的输出里若出现它们（或任何
+`pt-` 样式的字符串），先修再发。
 
 > **README 里相对链接到的 `docs/` 文件必须在这份清单里**：README 在 npm 页面上是正文，相对链接指向包内路径，清单漏一项就是一个 404（`docs/PROMO_BADGE.md` 首次加进来时就漏过一次）。改 `files` 时对照 README 双语里的 `](docs/…)` 全量核一遍。
 
 > **改包名时必须同时核对的三处身份**（0.3.0 在这上面栽过两次，都是**静默**的）：
-> 1. `tsdown.config.ts` 的 `PLUGIN_ID` —— 客户端 bundle 在 `window.__ModuleLoader__` 声明的模块 id **必须等于包名**，否则花名册配不上行、永不 invalidate，第二次执行抛 `duplicate factory registration`（插件「启用失败」）。
+> 1. `tsdown.config.ts` 的 `PLUGIN_ID` —— 客户端 bundle 在 `window.__ModuleLoader__` 声明的模块 id **必须等于包名**，否则花名册配不上行、永不 invalidate，第二次执行抛 `duplicate factory registration`（插件「启用失败」）。**它读的是 `package.json` 的 `name`，所以改包名后必须重新 `pnpm run build`**，否则 `lib/` 里留着旧 id。
 > 2. `src/client/slot-keys.ts` —— 配置卡片槽位按**包名**建键（`plugins.bundle.config` 用裸包名、`plugins.row.config` 用 `<包名>#<entry id>`），硬编码旧名会让卡片正文**整片空白且不报错**。
 > 3. profile 侧的依赖键与 `dsh.profile.bundles` —— 本地 `link:` 安装的键名也要跟着改成 scoped，否则 patch 里的 `name` 解析不到（`ERR_MODULE_NOT_FOUND`）。
 >
 > 前两处由 `tests/plugin-id.spec.ts` 钉住（含「旧写法必然失败」的回归断言与构建产物断言）。第三处是**本地 `link:` 安装**时才走到的路径，静态测试覆盖不到，真出错表现为加载 patch 时 `ERR_MODULE_NOT_FOUND`——改包名后要在本地 link 安装一次确认 profile 侧键名与 `dsh.profile.bundles` 都已跟着改成 scoped。（旧文此处写「见第 10 步」，但本文件从未有过第 10 步，该引用自加入起即悬空，已就地说明。）
 
-**发布前检查**（可选但推荐）：
+**发布前检查**（推荐）：
 
 ```bash
-npm pack --dry-run
+npm pack --dry-run      # 核对清单与包名
+npm stage publish --dry-run
 ```
 
-### 7. 2FA 确认（若账号开启两步验证）
+### 7. 批准暂存版本（**这一步才需要 2FA**）
 
-> **本项目约定：用浏览器授权，不用 `--otp` 方式。** `npm publish` 若提示 EOTP，按 npm CLI 给出的 URL 在浏览器登录确认即可，终端内的 `npm publish` 会自动继续。**不要**用 `npm publish --otp=<6位验证码>` 绕过。
+```bash
+npm stage list                     # 拿 stage-id
+npm stage approve <stage-id>       # 输入 6 位 OTP
+```
 
-> ⚠️ **这一步必须在交互式终端里做。** npm 在 stdout 不是 TTY 时（管道 `| tail`、重定向、后台任务、CI、agent 的 shell）会**印出被遮蔽的授权链接**（`…/auth/cli/***`）并**立刻退出**，不会等待浏览器确认。需要 2FA 的发布会话请直接在自己的终端跑 `npm publish`。
+两种方式都可用，选一种：
 
-> ⚠️ **授权窗口只有约 5 分钟，别把链接转给别人等回复。** npm 拿到 `authId` 后每隔约 3 秒轮询
-> `GET /-/v1/done?authId=…`；**约 92 次（≈4.6 分钟）后放弃并把该 authId 作废**，之后即使确认也只会
-> 拿到 `E404`。所以「AI 跑命令 → 把链接转述给用户 → 用户切窗口确认 → 回复 AI」这条链路**必然赶不上**：
-> 0.4.3 发布当天这样试了 4 次（含用 `script` 伪造 pty 绕过 TTY 那层）**全部失败**，而用户在自己的终端
-> 里跑的那一次，**49 秒**就完成了（轮询 13 次即 `GET 200`）。实测数据见
+| 方式 | 做法 | 适用 |
+| --- | --- | --- |
+| **CLI** | `npm stage approve <stage-id>`，按提示输入 6 位码 | 有 authenticator App / 硬件密钥 |
+| **网页** | npmjs.com → **Staged Packages** 标签页 → **Approve** | 不想在终端敲码 |
+
+> **这一步没有「约 5 分钟授权窗口」的问题。** 那是 `npm publish` 的浏览器回调流程
+> （npm 轮询 `GET /-/v1/done?authId=…`，约 92 次 ≈ 4.6 分钟后作废该 authId）—— 也正
+> 因为如此，那条链路一旦需要把链接转述给别人就**必然赶不上**（0.4.3 当天试了 4 次全
+> 失败，而用户自己终端里那次 49 秒完成，见 `docs/RELEASE_EXPERIENCE.md` §1）。
+> `npm stage approve` 提交的是一个静态验证码，不存在轮询窗口，所以**谁跑都行**，
+> 但按 §1 的约定仍然建议维护者自己来。
+
+若 OTP 报错（时钟偏移、码过期），重跑一次 `npm stage approve <stage-id>` 即可 ——
+**暂存区里的版本不会被前一次失败消耗掉**，也不需要重新上传或改版本号。
+
+版本号在批准前**不会被占用**：`npm stage reject <stage-id>` 之后可以用同一个版本号重新
+`npm stage publish`。一旦批准，那个版本号就永久属于该 tarball（与 `npm publish` 一致）。
+
+### 7.5 历史记录：`npm publish` 的 2FA 为什么走不通（**别再走回去**）
+
+> 这一节记录的是**旧流程**（直接 `npm publish`）踩过的坑。2026-11-21 起改用
+> §6 的 staged 发布，这些坑不再适用 —— 但留着，因为它们是「为什么不能用
+> `npm publish`」的证据，而下次有人觉得 staged 太麻烦、想改回去时，需要看到代价。
+
+> **旧流程的问题**：`npm publish` 会在上传前索要 2FA，且必须**在同一个交互式会话里**
+> 完成。npm 在 stdout 不是 TTY 时（管道 `| tail`、重定向、后台任务、CI、agent 的
+> shell）会**印出被遮蔽的授权链接**（`…/auth/cli/***`）并**立刻退出**，不会等待确认。
+
+> ⚠️ **旧流程的授权窗口只有约 5 分钟。** npm 拿到 `authId` 后每隔约 3 秒轮询
+> `GET /-/v1/done?authId=…`；**约 92 次（≈4.6 分钟）后放弃并把该 authId 作废**，之后
+> 即使确认也只会拿到 `E404`。所以「AI 跑命令 → 把链接转述给用户 → 用户切窗口确认 →
+> 回复 AI」这条链路**必然赶不上**：0.4.3 发布当天这样试了 4 次（含用 `script` 伪造 pty
+> 绕过 TTY 那层）**全部失败**，而用户在自己的终端里跑的那一次，**49 秒**就完成了
+> （轮询 13 次即 `GET 200`）。实测数据见
 > [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §1。
+>
+> **staged 发布把这一步的窗口问题彻底消掉了**：`npm stage publish` 不索要 2FA，
+> `npm stage approve` 提交的是一个静态验证码，没有轮询、没有 5 分钟限制。
 
-若浏览器打开的验证 URL 失效（404），重跑一次 `npm publish` 让 npm 生成新的授权链接，再在浏览器确认。
-（链接 404 = 那次 2FA 会话已过期，此时**包一个字节都没上传**，重试安全、**不需要改版本号**。）
-
-> ⚠️ **1.1.0 实测（2026-10-17）：看 `+ 包名@X.Y.Z` 那一行不足以判断成功。** 那次 2FA 没在窗口内
-> 完成，`npm publish` 却**照样打印了 `+ @dmh2002/dsh-connect-qoder@1.1.0` 并以 exit 0 结束**，
-> 而注册表里查无此版本（tarball 直链 404、带 token 查 404、镜像 404）。**只有第 8 步那条直连回查
-> 才作数**——`+` 行只能读作「CLI 以为成功了」。详见
+> ⚠️ **1.1.0 实测（2026-10-17）：看 `+ 包名@X.Y.Z` 那一行不足以判断成功。** 那次 2FA
+> 没在窗口内完成，`npm publish` 却**照样打印了 `+ @dmh2002/dsh-connect-qoder@1.1.0` 并以
+> exit 0 结束**，而注册表里查无此版本（tarball 直链 404、带 token 查 404、镜像 404）。
+> **只有第 8 步那条直连回查才作数**——`+` 行只能读作「CLI 以为成功了」。详见
 > [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §2。
+>
+> 这条在 staged 流程下**同样适用**：`npm stage publish` 的 exit 0 只代表「进了暂存区」，
+> 必须用 §8 的直连回查确认 `latest` 真的变了。
 
 ### 8. 验证发布成功
 
 ```bash
-npm view @dmh2002/dsh-connect-qoder --prefer-online version            # 应显示 X.Y.Z
-npm view @dmh2002/dsh-connect-qoder --prefer-online dist-tags.latest   # 应为 X.Y.Z
+npm view @bokutake/dsh-connect-qoder --prefer-online version            # 应显示 X.Y.Z
+npm view @bokutake/dsh-connect-qoder --prefer-online dist-tags.latest   # 应为 X.Y.Z
 ```
 
 **权威验证（必须用这条，绕开本机代理缓存）**——作用域在 registry 路径里要写成 `%2f`：
 
 ```bash
-curl -s --noproxy '*' -H "Cache-Control: no-cache" https://registry.npmjs.org/@dmh2002%2Fdsh-connect-qoder \
+curl -s --noproxy '*' -H "Cache-Control: no-cache" https://registry.npmjs.org/@bokutake%2Fdsh-connect-qoder \
   | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log('latest:',j['dist-tags'].latest);console.log('has X.Y.Z:',!!j.versions['X.Y.Z']);console.log('published:',j.time['X.Y.Z'])})"
 ```
 
 应打印 `latest: X.Y.Z` 与本次发布时间。**再核对 tarball 的 shasum 与本地 `npm pack --dry-run` 输出一致**，确认上传的就是本次构建的代码。
+
+> **staged 流程下的额外一步**：批准**之前**跑这段会看到 `latest` 还是旧版本 —— 那是
+> 「还在暂存区」的正常表现，不是失败。判据是 `npm stage list` 里还有没有这个版本：
+> 有 = 待批准；没有且 `latest` 没变 = 被 reject 或从未上传成功。
+
 
 > ⚠️ **先看 packument，别用 tarball 直链下结论（1.2.1 实测）。** packument 与 tarball 是**两个**传播时刻：`time['X.Y.Z']` 出现（约 2 分钟）后，tarball 直链仍可能 **404 约 3 分钟**——返回的是 21 字节的 `{"error":"Not found"}`（`file` 会告诉你那是 JSON 不是 gzip）。**registry 的 `dist.shasum` 与本地 dry-run 一致即已足够**，不需要下载就能核；真要逐字节比对产物，把下载重试放宽到几分钟。把「packument 有版本 + tarball 404」读成失败，会把一次**成功**的发布误判掉。这个滞后**不是固定值**：1.4.0 那次 `latest` 翻转后 tarball 立刻就是 HTTP 200（见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §10.1），所以「轮询第 N 次仍 404」不能当健康度读——判据始终是 packument 的 `time` 与 `dist.shasum`。
 
@@ -282,11 +373,26 @@ gh release view vX.Y.Z --json name,tagName,isDraft,isPrerelease,assets
 
 ## 常见问题
 
-- **`npm publish` 报 EOTP**：账号开启了 2FA，**按第 7 步在浏览器授权**（npm CLI 给出的 URL），不要用 `--otp=<码>` 命令行方式。链接 404 就重跑 `npm publish` 生成新链接。
-- **`npm publish` 报 EOTP，但拿不到授权链接、而且它一闪就退出了**：这一步**必须在交互式终端里跑**。npm 只在 stdout 是 TTY 时才**自动打开浏览器**、并**留在原地等待**授权；一旦进了管道、重定向或后台任务，授权链接会被 npm 自己印成 `***` 且进程立即退出。
+**先看这一条 —— 2026-11-21 起行为已变：**
+
+- **`npm publish` 报 `E403 ... Two-factor authentication ... is required to publish packages`**：
+  npm 不再接受「发布时当场出示 2FA」的旧路径。**不要**去找 `--otp` 绕过 —— 改成
+  `npm stage publish --access public`，再 `npm stage approve <stage-id>`（§6 / §7）。
+  即使你自己的交互式终端里跑 `npm publish` 也一样被拒，这不是环境问题。
+- **`npm stage publish` 退出码 0，但用户装不到**：正常。版本只在**暂存区**，必须完成
+  `npm stage approve`。用 `npm stage list` 看是否还在待批。
+- **`npm stage approve` 报 OTP 错（时钟偏移 / 码过期）**：直接重跑一次同一条命令。
+  暂存版本**不会被前一次失败消耗**，也不用重新上传或改版本号。
+- **想放弃这次暂存**：`npm stage reject <stage-id>`。版本号**没被占用**，可以同号重发。
+
+以下为旧流程（`npm publish`）时代的记录，**仅在排查历史问题时参考**：
+
+- **`npm publish` 报 EOTP**：账号开启了 2FA，过去要在浏览器授权（npm CLI 给出的 URL）。链接 404 就重跑 `npm publish` 生成新链接。
+- **`npm publish` 报 EOTP，但拿不到授权链接、而且它一闪就退出了**：旧流程**必须在交互式终端里跑**。npm 只在 stdout 是 TTY 时才**自动打开浏览器**、并**留在原地等待**授权；一旦进了管道、重定向或后台任务，授权链接会被 npm 自己印成 `***` 且进程立即退出。
 - **`npm publish` 报 409，但两种报文的含义完全相反，别混为一谈**：
-  - `Cannot publish over previously staged version "X.Y.Z"` —— 该版本在 registry 上处于**暂存（staged）未提交**状态。它**不是**「已发布」。常见来源是需要 2FA 而中途没走完的那次发布请求。**先别急着改版本号**——稍等重试，或在 npm 网站上批准/丢弃这次暂存。
+  - `Cannot publish over previously staged version "X.Y.Z"` —— 该版本在 registry 上处于**暂存（staged）未提交**状态。它**不是**「已发布」。常见来源是需要 2FA 而中途没走完的那次发布请求。**先别急着改版本号**——在 npm 网站上批准/丢弃这次暂存，或用 `npm stage list` / `npm stage reject`。
   - `You cannot publish over the previously published versions: X.Y.Z` —— 这才是**已经发布成功**。此时第 8 步的直连核验会显示 `latest: X.Y.Z`。
-- **`npm error code E404 ... GET https://registry.npmjs.org/-/v1/done?authId=***`**：**2FA 会话过期**，不是包名错、也不是网络问题（npm 轮询约 92 次 ≈4.6 分钟后作废该 authId）。重跑 `npm publish` 生成新链接即可，**不需要改版本号**——此时包一个字节都没上传。
+- **`npm error code E404 ... GET https://registry.npmjs.org/-/v1/done?authId=***`**：**2FA 会话过期**，不是包名错、也不是网络问题（npm 轮询约 92 次 ≈4.6 分钟后作废该 authId）。这是旧流程特有的失败模式；staged 流程没有这个轮询，不会出现。
 - **想用 `authId` 判断「这条链接属于哪次运行」——做不到，别试**：npm **自己**就把 authId 遮蔽成 `***` 写进日志，所以它不可能在任何日志里出现。0.4.3 发布时我用「authId 在日志里搜不到」推出过『这条链接不是我的运行』——那是**无效推理**（必然搜不到）。要归属请换指纹：轮询次数（92 次 = 超时；十几次就 200 = 当场确认成功）、时间戳、`~/.zsh_history`。
-- **判定发布成败，先读日志再查 registry**：日志里**没有任何 `PUT` 行** = 请求未到达；`PUT 401` + 轮询 92 次 + `GET 404` = 2FA 超时（真失败）；`PUT 202` + "being processed" = 已受理、等约 2 分钟；`exit 0` 且输出里有 `+ @dmh2002/dsh-connect-qoder@X.Y.Z` = 真发布（暂存时**没有**这一行）。完整三态表见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §2。
+- **判定发布成败，先读日志再查 registry**：日志里**没有任何 `PUT` 行** = 请求未到达；`PUT 401` + 轮询 92 次 + `GET 404` = 2FA 超时（真失败）；`PUT 202` + "being processed" = 已受理、等约 2 分钟；`exit 0` 且输出里有 `+ 包名@X.Y.Z` = 真发布（**暂存时没有这一行**）。完整三态表见 [`docs/RELEASE_EXPERIENCE.md`](docs/RELEASE_EXPERIENCE.md) §2。
+

@@ -379,7 +379,13 @@ describe('真实 apply() 的 settings 命名空间绑定', () => {
       composerProps.openSettings()
       vi.runAllTimers()
       // 重试全部用尽 ⇒ 退路接管，且收的是 npm 包名（插件市场按包名索引 bundle 行）。
-      expect(opened).toEqual(['@dmh2002/dsh-connect-qoder'])
+      //
+      // 不写死具体包名：本仓库是独立分叉，包名已换成自己的 scope。这里要守的是
+      // 「退路收的是**带 scope 的包名**，不是 loader entry id」这个语义。
+      expect(opened).toHaveLength(1)
+      expect(opened[0]!.startsWith('@')).toBe(true)
+      expect(opened[0]).toContain('/')
+      expect(opened[0]).not.toBe('dsh-connect-qoder')
     } finally {
       vi.useRealTimers()
       document.body.innerHTML = ''
@@ -409,7 +415,9 @@ describe('真实 apply() 的 settings 命名空间绑定', () => {
       // 没有设置面板 → 跳转无从下手 → 退路现查到刚挂上来的服务。
       props()!.openSettings()
       vi.runAllTimers()
-      expect(opened).toEqual(['@dmh2002/dsh-connect-qoder'])
+      expect(opened).toHaveLength(1)
+      expect(opened[0]!.startsWith('@')).toBe(true)
+      expect(opened[0]).not.toBe('dsh-connect-qoder')
     } finally {
       vi.useRealTimers()
       document.body.innerHTML = ''

@@ -13,20 +13,46 @@
   <a href="#configuration">Configuration</a> ·
   <a href="#account-pool">Account pool</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/issues">Issues</a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/issues">Issues</a>
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/%40dmh2002%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/v/%40dmh2002%2Fdsh-connect-qoder?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
-  <a href="https://www.npmjs.com/package/%40dmh2002%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/d18m/%40dmh2002%2Fdsh-connect-qoder?style=flat-square&label=downloads&color=cb3837" alt="npm downloads"></a>
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/dingminhua/dsh-connect-qoder/ci.yml?branch=main&style=flat-square&label=tests" alt="test status"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/dingminhua/dsh-connect-qoder?style=flat-square" alt="MIT license"></a>
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/stargazers"><img src="https://img.shields.io/github/stars/dingminhua/dsh-connect-qoder?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://www.npmjs.com/package/%40bokutake%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/v/%40bokutake%2Fdsh-connect-qoder?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/%40bokutake%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/d18m/%40bokutake%2Fdsh-connect-qoder?style=flat-square&label=downloads&color=cb3837" alt="npm downloads"></a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/bokutake/dsh-connect-qoder/ci.yml?branch=main&style=flat-square&label=tests" alt="test status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/bokutake/dsh-connect-qoder?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/stargazers"><img src="https://img.shields.io/github/stars/bokutake/dsh-connect-qoder?style=flat-square" alt="GitHub stars"></a>
 </p>
 
 A standalone [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) bundle plugin. It connects your Qoder account's models to the DSH model picker, with an account pool, daily check-in, credit readouts and model management. **The CN and international editions are two parallel providers (`qoder` / `qoder-global`) that can be used at the same time**; the plugin's settings page separates them with tabs.
 
 > Qoder does not expose an OpenAI-compatible endpoint (its official SDK is only an agent launcher), so this plugin talks to Qoder's cosy gateway directly, implementing a minimal client for the protocol. No Qoder desktop sign-in is needed — just a PAT (Personal Access Token).
+
+## About this repository (an independently maintained fork)
+
+This is an **independent fork** of
+[**`dingminhua/dsh-connect-qoder`**](https://github.com/dingminhua/dsh-connect-qoder).
+The upstream project announced end-of-maintenance in
+[issue #49](https://github.com/dingminhua/dsh-connect-qoder/issues/49), citing Qoder's removal of
+daily check-in credits for free users.
+
+This fork continues for a different reason, unrelated to the plugin's core purpose: upstream had
+defects in **billing attribution** (the granularity of `business` records, and a missing per-turn
+closure) and in **device identity** (where the `machineId` / `machineToken` values come from).
+Together those meant **no per-model consumption rows ever appeared in the Qoder billing console**.
+Those defects have nothing to do with the check-in policy change above, so they are worth fixing
+on their own. See the `1.28.0` section of [`CHANGELOG.md`](CHANGELOG.md) for the changes, and
+[`LICENSE-MODIFICATIONS.md`](LICENSE-MODIFICATIONS.md) for the modification scope and licensing.
+
+**Maintenance model**: maintained on a best-effort basis, primarily to support my own usage.
+Bug reports and PRs are welcome, but **no maintenance SLA, response-time commitment, or feature
+roadmap is guaranteed** — filing a request does not obligate me to implement it, and releases
+will not follow a schedule. For urgent needs, please fork it yourself or fall back to the
+upstream release.
+
+If you want an actively maintained Qoder integration with committed timelines, this repository
+may not be your best choice. If your requirement is "billing rows reconcile, and device identity
+does not contradict itself", this is probably the right place.
 
 ## Features
 
@@ -85,9 +111,16 @@ Encoding and signing details (custom alphabet, `n/3` rearrangement, `cosy&<SECRE
 ### From a published package (recommended)
 
 ```bash
-dsh plugin --profile desktop add @dmh2002/dsh-connect-qoder   # Desktop
-dsh plugin --profile web add @dmh2002/dsh-connect-qoder       # Web
+dsh plugin --profile desktop add @bokutake/dsh-connect-qoder   # Desktop
+dsh plugin --profile web add @bokutake/dsh-connect-qoder       # Web
 ```
+
+> **Switching from upstream**: the package name changed from `@dmh2002/dsh-connect-qoder` to
+> `@bokutake/dsh-connect-qoder`. Run `dsh plugin remove @dmh2002/dsh-connect-qoder` first, then
+> install the new one — they are different package names, so both can coexist, but enabling both
+> at once registers the same provider twice. **Your configuration is not lost**: the plugin's
+> identity inside DSH is unscoped (see the note below), so the account pool and model selections
+> carry over.
 
 Then **restart that profile's DSH process** (the host half of a bundle loads at startup). You can also search for `dsh-connect-qoder` in DSH's "Plugin market / Bundles" and install it in one click.
 
@@ -99,12 +132,12 @@ Then **restart that profile's DSH process** (the host half of a bundle loads at 
 >
 > That entry runs `dsh/lib/bin.js` inside `app.asar` via `ELECTRON_RUN_AS_NODE`; the profile is still chosen with `--profile`.
 
-> The npm package name carries the `@dmh2002/` scope. The plugin's **configuration identity inside DSH does not** — the settings namespace, the `/plugins/dsh-connect-qoder/…` routes and the CLI program name all stay `dsh-connect-qoder`, so anyone upgrading from 0.2.0 keeps their saved configuration with no need to re-enter PATs. The settings page's addressing no longer depends on the package name either: it is a `settings.section` keyed by the **unscoped** entry id. But the **browser bundle's module id**, the model-picker label and the package name the Settings button falls back to when jumping into the plugin market are still keyed by the scoped package name; these are injected from `package.json` at build time, so a rename cannot leave them behind.
+> The npm package name carries the `@bokutake/` scope (this repository is an independent fork, moved over from upstream's `@dmh2002/`). The plugin's **configuration identity inside DSH does not** — the settings namespace, the `/plugins/dsh-connect-qoder/…` routes and the CLI program name all stay `dsh-connect-qoder`, so anyone switching from upstream or upgrading from 0.2.0 keeps their saved configuration with no need to re-enter PATs. The settings page's addressing no longer depends on the package name either: it is a `settings.section` keyed by the **unscoped** entry id. But the **browser bundle's module id**, the model-picker label and the package name the Settings button falls back to when jumping into the plugin market are still keyed by the scoped package name; these are injected from `package.json` at build time, so a rename cannot leave them behind.
 
 ### From source (development)
 
 ```bash
-git clone https://github.com/dingminhua/dsh-connect-qoder.git
+git clone https://github.com/bokutake/dsh-connect-qoder.git
 cd dsh-connect-qoder
 pnpm install
 pnpm run check        # typecheck + test + build must all pass first
@@ -311,7 +344,7 @@ pnpm exec dsh-connect-qoder doctor --json        # machine-readable output
 `status` really exchanges a jobToken and fetches the model catalog (then reads usage once, read-only), so it needs that region's environment or vault PAT; `doctor` is fully offline.
 
 > **Two things measured on a real machine**:
-> 1. **Do not use a bare path like `node node_modules/dsh-connect-qoder/lib/bin.js`** — as of 0.3.0 the package name is scoped, so the symlink lives at `node_modules/@dmh2002/dsh-connect-qoder`; the old path just gives `MODULE_NOT_FOUND` (a missing **entry file**, not a missing peer).
+> 1. **Do not use a bare path like `node node_modules/dsh-connect-qoder/lib/bin.js`** — the package name is scoped, so the symlink lives at `node_modules/@bokutake/dsh-connect-qoder` (it was `@dmh2002/` before the fork); the old path just gives `MODULE_NOT_FOUND` (a missing **entry file**, not a missing peer).
 > 2. The CLI depends on the host-provided peers (`@deepseek-ai/dsh-atomic-write` / `dsh-home-paths`). Locally, pnpm installs them into the profile's dependency tree, and both `pnpm exec` and an npm-installed tarball work. But that **depends on your pnpm version and `auto-install-peers` setting** — if you see `Cannot find package '@deepseek-ai/dsh-atomic-write'`, that layer did not get installed. Provider registration, the settings page and chat are **unaffected** (they run inside the host, which resolves those names). The sibling workbuddy's issue #47 is the same shape; its fix (host-first, fall back to a built-in copy on demand) applies here too and has not been ported yet.
 
 ## Platform support

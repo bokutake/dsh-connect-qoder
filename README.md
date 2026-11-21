@@ -15,18 +15,41 @@
   <a href="#配置">配置</a> ·
   <a href="#账号池">账号池</a> ·
   <a href="CHANGELOG.md">更新日志</a> ·
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/issues">问题反馈</a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/issues">问题反馈</a>
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/%40dmh2002%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/v/%40dmh2002%2Fdsh-connect-qoder?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
-  <a href="https://www.npmjs.com/package/%40dmh2002%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/d18m/%40dmh2002%2Fdsh-connect-qoder?style=flat-square&label=downloads&color=cb3837" alt="npm downloads"></a>
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/dingminhua/dsh-connect-qoder/ci.yml?branch=main&style=flat-square&label=tests" alt="test status"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/dingminhua/dsh-connect-qoder?style=flat-square" alt="MIT license"></a>
-  <a href="https://github.com/dingminhua/dsh-connect-qoder/stargazers"><img src="https://img.shields.io/github/stars/dingminhua/dsh-connect-qoder?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://www.npmjs.com/package/%40bokutake%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/v/%40bokutake%2Fdsh-connect-qoder?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/%40bokutake%2Fdsh-connect-qoder"><img src="https://img.shields.io/npm/d18m/%40bokutake%2Fdsh-connect-qoder?style=flat-square&label=downloads&color=cb3837" alt="npm downloads"></a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/bokutake/dsh-connect-qoder/ci.yml?branch=main&style=flat-square&label=tests" alt="test status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/bokutake/dsh-connect-qoder?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/bokutake/dsh-connect-qoder/stargazers"><img src="https://img.shields.io/github/stars/bokutake/dsh-connect-qoder?style=flat-square" alt="GitHub stars"></a>
 </p>
 
 一个独立的 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) bundle 插件。它把 Qoder 账号的模型接到 DSH 的模型选择器，同时提供模型管理与只读的用量概览。**国内版与国际版是两个并行的供应商（`qoder` / `qoder-global`），可同时使用**；插件的设置页以 tab 区分两者，方便统一管理。
+
+## 关于本仓库（独立维护的分叉）
+
+本仓库是 [**`dingminhua/dsh-connect-qoder`**](https://github.com/dingminhua/dsh-connect-qoder)
+的**独立分叉**。上游已于
+[issue #49](https://github.com/dingminhua/dsh-connect-qoder/issues/49) 公告停止维护，理由是
+Qoder 官方取消了免费用户的每日签到积分。
+
+本仓库继续维护它，起因是另一个与本插件核心用途无关的问题：上游在**计费记账**（
+`business` 记录的粒度与轮次闭合）和**设备身份**（`machineId` / `machineToken` 的取值来源）
+这两侧存在缺陷，导致 Qoder 计费控制台里一条逐模型消费行都没有。这些缺陷与停更公告所述的
+签到政策变更没有关系，所以值得单独修。具体改动见 [`CHANGELOG.md`](CHANGELOG.md) 的
+`1.28.0` 一节，修改授权与范围见 [`LICENSE-MODIFICATIONS.md`](LICENSE-MODIFICATIONS.md)。
+
+**维护方式**：按 best-effort（尽力而为）进行，主要用于支持作者自己的日常使用。
+**欢迎**提交 issue 与 PR，但**不承诺**任何维护 SLA、响应时限或功能路线图 —— 我不会因为
+某个需求被提出就一定要实现它，也不会定期发布版本。紧急问题请自行 fork 或退回上游版本。
+
+如果你在找一个仍在活跃维护、且有明确排期的 Qoder 接入方案，这个仓库可能不是最优选择；
+如果你的诉求是「记账能对上、身份不矛盾」，那这里大概是对的。
+
+---
+
 
 > Qoder 官方不提供 OpenAI 兼容端点（其官方 SDK 只是 agent 启动器），因此本插件直连 Qoder 的 cosy 网关，实现了协议的最小客户端，无需在 Qoder 桌面端登录——只需一个 PAT（Personal Access Token）。
 
@@ -88,9 +111,14 @@ DSH PiAiAdapter（每个 provider 一套）
 ### 从发布包安装（推荐）
 
 ```bash
-dsh plugin --profile desktop add @dmh2002/dsh-connect-qoder   # Desktop
-dsh plugin --profile web add @dmh2002/dsh-connect-qoder       # Web
+dsh plugin --profile desktop add @bokutake/dsh-connect-qoder   # Desktop
+dsh plugin --profile web add @bokutake/dsh-connect-qoder       # Web
 ```
+
+> **从上游换装**：包名已从 `@dmh2002/dsh-connect-qoder` 改为 `@bokutake/dsh-connect-qoder`。
+> 先 `dsh plugin remove @dmh2002/dsh-connect-qoder` 再装新的 —— 两个包名不同，可以并存，
+> 但同时启用会让同一个 provider 注册两次。**配置不会丢**：插件在 DSH 内的标识不带作用域
+> （见下面那条说明），账号池与模型勾选照旧生效。
 
 装完**重启该 profile 的 DSH 进程**（bundle 的 host 半边在启动时加载）。也可以在 DSH 的「插件市场 / Bundles」里搜 `dsh-connect-qoder` 一键安装。
 
@@ -102,12 +130,12 @@ dsh plugin --profile web add @dmh2002/dsh-connect-qoder       # Web
 >
 > 新入口内部以 `ELECTRON_RUN_AS_NODE` 运行 `app.asar` 里的 `dsh/lib/bin.js`，profile 仍由 `--profile` 决定。
 
-> npm 包名带 `@dmh2002/` 作用域。插件在 DSH 内的**配置标识不带作用域**——设置命名空间、`/plugins/dsh-connect-qoder/…` 路由与命令行程序名都仍是 `dsh-connect-qoder`，所以 0.2.0 之前装过的用户升级后配置照旧生效，不用重填 PAT。设置页的寻址也不再依赖包名：它是 `settings.section`，键是**不带作用域**的 entry id。但**浏览器 bundle 的模块 id、模型选择器标签与「设置」按钮退回插件市场时用的包名**仍按带作用域的包名建，这几处由构建期从 `package.json` 注入，改包名不会漏下它们。
+> npm 包名带 `@bokutake/` 作用域（本仓库是独立分叉，已从上游的 `@dmh2002/` 换过来）。插件在 DSH 内的**配置标识不带作用域**——设置命名空间、`/plugins/dsh-connect-qoder/…` 路由与命令行程序名都仍是 `dsh-connect-qoder`，所以从上游换装或从 0.2.0 之前升级的用户，配置照旧生效，不用重填 PAT。设置页的寻址也不再依赖包名：它是 `settings.section`，键是**不带作用域**的 entry id。但**浏览器 bundle 的模块 id、模型选择器标签与「设置」按钮退回插件市场时用的包名**仍按带作用域的包名建，这几处由构建期从 `package.json` 注入，改包名不会漏下它们。
 
 ### 从源码构建（开发）
 
 ```bash
-git clone https://github.com/dingminhua/dsh-connect-qoder.git
+git clone https://github.com/bokutake/dsh-connect-qoder.git
 cd dsh-connect-qoder
 pnpm install
 pnpm run check        # typecheck + test + build 全绿后再安装
@@ -314,7 +342,7 @@ pnpm exec dsh-connect-qoder doctor --json        # 机器可读输出
 `status` 会真实交换一次 jobToken 并拉取模型目录（随后只读查询一次用量），因此需要对应区域的环境变量或 vault PAT；`doctor` 完全离线。
 
 > **两条实测过的注意事项**：
-> 1. **别用 `node node_modules/dsh-connect-qoder/lib/bin.js` 这种裸路径**——0.3.0 起包名带作用域，软链在 `node_modules/@dmh2002/dsh-connect-qoder`，写旧路径只会得到 `MODULE_NOT_FOUND`（缺的是**入口文件**，不是 peer）。
+> 1. **别用 `node node_modules/dsh-connect-qoder/lib/bin.js` 这种裸路径**——包名带作用域，软链在 `node_modules/@bokutake/dsh-connect-qoder`（旧版是 `@dmh2002/`），写旧路径只会得到 `MODULE_NOT_FOUND`（缺的是**入口文件**，不是 peer）。
 > 2. CLI 依赖宿主提供的 peer 包（`@deepseek-ai/dsh-atomic-write` / `dsh-home-paths`）。本机实测：pnpm 会随包把它们装进 profile 的依赖树，`pnpm exec` 与 npm 装的 tarball 都能跑通。但这**取决于 pnpm 版本与 `auto-install-peers` 配置**——如果在你机器上报 `Cannot find package '@deepseek-ai/dsh-atomic-write'`，那是这一层没装上；设置页与 provider **不受影响**（它们在宿主进程内，宿主自己解析这些名字）。同族 workbuddy 的 issue #47 是同一个形状，其修复方案（宿主优先、按需回落自带实现）适用于本项目，尚未移植。
 
 ## 平台支持

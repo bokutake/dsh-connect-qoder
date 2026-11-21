@@ -46,8 +46,15 @@ describe('样式表的所有权', () => {
   it('data-plugin 用的是 npm 包名，宿主才认得出来（清样式时能删掉）', () => {
     // 宿主按包名删样式表。写 entry id 的话，宿主永远找不到自己的东西。
     expect(PLUGIN_STYLE_OWNER).toBe(QODER_PACKAGE_NAME)
-    expect(PLUGIN_STYLE_OWNER).toBe('@dmh2002/dsh-connect-qoder')
-    // Loader entry id 是**另一个**标识符（配置命名空间与 /plugins 路由用它）。
+    // 断言它确实是**带 scope 的 npm 包名**，而不是 loader entry id
+    // （`dsh-connect-qoder`，配置命名空间与 /plugins 路由用它）。
+    //
+    // 这里**不写死某个具体包名**：本仓库是独立分叉，包名已从
+    // `@dmh2002/dsh-connect-qoder` 改成自己的 scope。写死字面量会让「改名」这种
+    // 正常操作每次都撞红，而这条测试真正要守的是「两者不是同一个东西」——
+    // 判据用 scope 前缀 + 不等于 entry id 就够了。
+    expect(PLUGIN_STYLE_OWNER.startsWith('@')).toBe(true)
+    expect(PLUGIN_STYLE_OWNER).toContain('/')
     expect(PLUGIN_STYLE_OWNER).not.toBe('dsh-connect-qoder')
   })
 
