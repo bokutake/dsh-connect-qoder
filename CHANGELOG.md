@@ -2,6 +2,62 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.28.1 (2026-11-21)
+
+> **修 1.28.0 的致命漏改：`cordis.patch.yml` 的 `name` 还留着旧包名，插件完全不激活。**
+> `dsh web` 启动时报 `failed to import: Error [ERR_MODULE_NOT_FOUND]: Cannot find package
+> '@dmh2002/dsh-connect-qoder'`，设置页看不到 Qoder，配置也读不出来。1.28.0 已发布到
+> npm 且不可覆盖，只能发 patch 版本 —— **装过 1.28.0 的请直接换 1.28.1**。
+
+### 修复
+
+- **`cordis.patch.yml` 的 `name` 改为 `@bokutake/dsh-connect-qoder`。**
+  - **现场**：1.28.0 装好后 `dsh web` 报 `dsh: warning: 1 entry did not activate` /
+    `dsh-connect-qoder (@dmh2002/dsh-connect-qoder): failed to import:
+    Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@dmh2002/dsh-connect-qoder'`。
+    同一 profile 的 `package.json` 依赖与 `node_modules/@bokutake/dsh-connect-qoder`
+    都已是新包名 —— 只有 patch 里那一行还是旧的。
+  - **根因**：1.28.0 改发布名时，`package.json`、`README`（中英）、`CHANGELOG`、
+    profile 的 `package.json` 都换了，**唯独漏了 patch 的 `name`**。讽刺的是那个
+    文件顶部注释恰好写着「`id` 保持不带作用域，只有 `name` 带 npm scope」——
+    漏的正是 `name`。
+  - **为什么测试与 CI 全绿还是炸**：没有任何一条测试检查过 patch 里的 `name`。
+    DSH 加载器是在 `dsh web` 启动时按这个名字去 profile 的 `node_modules` 解析包的，
+    静态测试跑不到那一步。这与 2026-10-12 那次 `tsdown.config.ts` 的 `PLUGIN_ID`
+    硬编码是**同一类**坑：改名只改了一半，静态看不见、真机激活才暴露。
+  - **改法**：`name` 换成 `@bokutake/dsh-connect-qoder`。`id` 仍是
+    `dsh-connect-qoder` —— 它承担设置命名空间与 `/plugins/<id>/…` 路由，改了会
+    孤儿化已保存配置。
+  - **为什么 bump 而不是覆盖 1.28.0**：npm 不允许覆盖已发布版本（tarball 会被
+    缓存、被 lockfile 钉住、被镜像同步）。1.28.0 的 tarball 里那个文件确实是坏的：
+
+    ```bash
+    curl --noproxy '*' -sL \
+      https://registry.npmjs.org/@bokutake/dsh-connect-qoder/-/dsh-connect-qoder-1.28.0.tgz \
+      | tar -xzO package/cordis.patch.yml | grep name
+    #   name: '@dmh2002/dsh-connect-qoder'
+    ```
+
+    所以只能发 1.28.1，并在升级说明里让人跳过 1.28.0。
+
+### 升级
+
+```bash
+dsh plugin remove @bokutake/dsh-connect-qoder
+dsh plugin add @bokutake/dsh-connect-qoder@1.28.1
+```
+
+**装过 1.28.0 的人**：插件未激活时配置读不出来，但 `cordis.patch.yml` 里你的设置
+正文**还在**（它由 profile 写，不是插件写的）。按上面两条换到 1.28.1 即可，账号池
+与模型勾选不用重配。
+
+### 测试
+
+- `tests/plugin-id.spec.ts`：新增「patch 的 `name` 必须等于 `package.json` 的
+  `name`」，并断言不得出现旧包名。**带反向验证** —— 把名字改回旧值，这条确实变红。
+- 全量：`1589 passed / 18 skipped`；`dsh --profile web --port 3099 --no-open`
+  真机启动无插件激活错误。
+
 ## 1.28.0 (2026-11-21)
 
 > **对齐官方 CLI：`business` 记录按轮归并、补上 `business/finish` 闭合、请求头与设备身份

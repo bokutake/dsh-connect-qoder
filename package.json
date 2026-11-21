@@ -2,7 +2,7 @@
   "name": "@bokutake/dsh-connect-qoder",
   "displayName": "DSH Connect Qoder",
   "description": "把 Qoder（通义灵码国内版 / 国际版）接入 DeepSeek Harness：PAT 多账号池、每日签到、积分读数与模型管理。（dingminhua/dsh-connect-qoder 的独立维护分叉）",
-  "version": "1.28.0",
+  "version": "1.28.1",
   "author": "bokutake <i@html.moe>",
   "contributors": [
     "dingminhua (upstream author, https://github.com/dingminhua/dsh-connect-qoder)"
