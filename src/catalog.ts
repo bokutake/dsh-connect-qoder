@@ -707,6 +707,18 @@ export class QoderCatalog {
     return this.find(selector)?.supportsImages ?? false
   }
 
+  /**
+   * 该模型的输出上限（上游 `max_output_tokens`）。未知模型返回 undefined，
+   * 由上游客户端用客户端同值的兜底（见 `upstream.ts` 的
+   * `DEFAULT_MAX_OUTPUT_TOKENS`）。
+   */
+  maxOutputTokensOf(selector: string): number | undefined {
+    const hit = this.find(selector)
+    if (hit === undefined) return undefined
+    const value = hit.maxOutputTokens
+    return Number.isFinite(value) && value > 0 ? value : undefined
+  }
+
   isReasoningOf(selector: string): boolean {
     return this.find(selector)?.supportsThinking ?? false
   }

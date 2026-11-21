@@ -41,10 +41,39 @@ import {
   type CosyFingerprint,
   type CosySessionContext,
 } from './cosy.ts'
-import { createChatBodyTemplate, buildQoderMessages, extractLatestUserPrompt, deepClone, applyModelKey, type QoderChatTemplate } from './messages.ts'
+import {
+  createChatBodyTemplate,
+  buildQoderMessages,
+  extractLatestUserPrompt,
+  deepClone,
+  applyModelKey,
+  applyBusinessIdentity,
+  applyCacheControl,
+  sessionTypeOf,
+  type QoderChatTemplate,
+  type QoderBusinessProduct,
+  type QoderBusinessStage,
+} from './messages.ts'
 import { readDeviceRisk } from './device-risk.ts'
+import {
+  identityHeaders,
+  localMachineEnv,
+  resolveDeviceIdentity,
+  type QoderDeviceIdentity,
+  type QoderIdentityOverride,
+  type DeviceIdentityMode as QoderDeviceIdentityMode,
+} from './device-identity.ts'
+import { ClientVersionResolver } from './client-version.ts'
 import { QODER_UPSTREAM_DOMAIN } from './status-paths.ts'
 import { isRouterModelId } from './native-modality.ts'
+import { QODER_CONNECT_VERSION } from './version.ts'
+import {
+  REGION_ENDPOINTS_PATH,
+  ENDPOINTS_TIMEOUT_MS,
+  orderWithLastFirst,
+  parseRegionEndpoints,
+  QoderEndpointCache,
+} from './endpoints.ts'
 
 // ---------------------------------------------------------------------------
 // 区域
@@ -157,6 +186,17 @@ export type QoderCheckinOutcome =
 
 const CHAT_PATH = '/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1'
 /**
+ * 轮次闭合端点。官方客户端在一轮用户提示结束时**必发**一次（实测：每轮恰好
+ * 1 次，与补全次数无关 —— 一轮 2 次补全仍是 1 次闭合）。
+ *
+ * 客户端源码里的位置是 `business/finish`（`Qd.finish()`），body 形状见
+ * {@link QoderUpstreamClient.finishTurn} 的使用处。
+ *
+ * 不发它，服务端只能等 TTL 释放租约：那一轮在记账上永远是「进行中」，控制台
+ * 里也就不产生逐条消费行 —— 这正是本插件长期缺的那一环。
+ */
+const FINISH_PATH = '/algo/api/v2/service/business/finish?Encode=1'
+/**
  * 每日签到走 `sash` 的**活动**接口。路径里没有「签到」二字（叫 campaigns），
  * 所以照着 checkin / signin / reward 猜永远猜不到——实测猜了 13 个全 404。
  * 注意是 **v1**（用量那套是 v2）。
@@ -194,18 +234,128 @@ const SASH_USER_AGENT = 'Qoder'
  * `HTTP 403 code 112`（「协议半改」的坏状态）。成对改之后 chat 两个区域都正常
  * 吐字，`qfmodel` / `dfmodel` 与新增的 `fast` / `smodel` 都实测通过。
  *
+ * ## `clienttype` 为什么是 `5` 不是 `10`（2026-11-21 抓包纠正）
+ *
+ * 上面那次是**只读探测**得出的「能拿到更多模型」的组合，不是「真实客户端发什么」。
+ * 对官方 CN CLI（qoderclicn 1.1.94）实测抓包 105 个请求，`cosy-clienttype`
+ * **全部是 `5`**，一次 `10` 都没有；同时它的目录里 13 个模型一个不少
+ * （`auto`/`fast`/`qmodel_latest`/`qmodel_38max`/`qfmodel`/`dmodel`/`dfmodel`/
+ * `gmodel`/`gfmodel`/`kmodel_latest`/`kmodel`/`jmodel`/`mmodel`）。
+ *
+ * 所以 `10` 是「桌面 App 通道」的值（magpie 至今用它，并配套 `product: app`、
+ * `Cosy-Version: 1.1.69`）。我们用 `cli` 产品线、走 PAT，就该是 `5` —— 与真实
+ * CLI 逐字一致，同时并不损失目录。**`10` 曾解决的是旧 `0.1.43` 版本号的目录
+ * 缩水问题，那个问题的真解是把版本号提上去，不是把 clienttype 换成桌面通道。**
+ *
+ * `cosy-version` 不再在这里写死：它必须与 bearer 载荷里的 `cosyVersion` 同值，
+ * 由 {@link QoderUpstreamClient.clientVersion} 统一提供（见 `client-version.ts`）。
+ *
  * 与 sash 面**无关**：`sashRequest` / `fetchUsageDirect` / `jobTokenGet` 是逐条
  * 手写请求头，没有展开 {@link DEFAULT_HEADERS}，所以这条改动碰不到签到与用量
  * （实测改完两个区域的用量与活动列表照常 200）。
- *
- * `COSY_VERSION`（`src/cosy.ts`，进 bearer **载荷**的那个）刻意**不**跟着改：
- * 它只参与签名与身份声明，实测在头为 `10` / `1.1.69` 时保持 `0.1.43` 两个区域
- * 的目录、对话、用量、活动全部正常。改它是另一件事，没有收益，不做。
  */
-const COSY_CLIENT_TYPE = '10'
-const COSY_VERSION_HEADER = '1.1.69'
+const COSY_CLIENT_TYPE = '5'
 const MODELS_PATH = '/algo/api/v2/model/list?Encode=1'
 const JOB_TOKEN_PATH = '/algo/api/v3/user/jobToken?Encode=1'
+
+/**
+ * `business.product` 的默认值：`cli`。
+ *
+ * 官方客户端有两条产品线，**默认值不同**：
+ *
+ * | 通道 | `product` | 证据 |
+ * | --- | --- | --- |
+ * | CLI / PAT | `cli` | `MKA = "cli"`，`Cs()` → `product: rtA() ?? process.env[...] ?? MKA` |
+ * | 桌面 App | `app` | `electronMain.js`：`Od = {clientType:10, businessProduct:"app"}` |
+ *
+ * 我们这条路径是「PAT → `/algo/api/v3/user/jobToken` → 聊天」，形态上是 CLI
+ * 通道，所以默认 `cli`。**这是实测结论，不是推断**：2026-11-21 抓 CN CLI
+ * 1.1.94 全程，`cosy-business-product` 出现 6 次，值全是 `cli`。
+ *
+ * 一条曾经的错误说法（本注释上一版写着、并在 CHANGELOG 里复述过）必须纠正：
+ * 它说「`Cosy-Business-Product` 这个头出现 **0 次**，`ide` 是从网页版抄来的
+ * 假设」。**头并不缺席** —— 它每次业务请求都带，只是取值在我们这边一直是错的
+ * （`ide`，既不是 `cli` 也不是 `app`）。「头不存在」与「头的值抄错了」是两回事，
+ * 前者会让人以为根本不用发这个头。
+ */
+const DEFAULT_BUSINESS_PRODUCT: QoderBusinessProduct = 'cli'
+
+/**
+ * 上报给上游的 `business.version` 的兜底值。
+ *
+ * **正常情况下这个常量不会被用到**：`business.version` 跟随
+ * {@link clientVersion}（真实客户端版本号），因为客户端上报的就是自己的版本。
+ * 这里只是「连版本号都解析不出来」时的最后一级兜底。
+ *
+ * 曾经这里默认取**插件版本**（`QODER_CONNECT_VERSION`），理由是「编造一个
+ * 不存在的客户端版本，等于在记账里留一条对不上的记录」。理由本身是对的，
+ * 结论却错了：插件版本同样不是客户端版本，它在服务端眼里是一个**从未发布过的
+ * Qoder 版本号**，比一个「旧但真实」的版本更显眼。真解是拿到真实版本号，
+ * 见 `client-version.ts`。
+ */
+const BUSINESS_VERSION_FALLBACK = '0.0.0-dev'
+
+/**
+ * `max_tokens` 的兜底上限。
+ *
+ * 与官方客户端的 `defaultTokens: 32e3` 同值 —— 这是客户端的**全局默认**，不是
+ * 我们发明的数。它只在两层上游信息都缺失时生效：
+ *
+ * 1. 调用方传入的 `maxOutputTokens`（来自 `/model/list` 的 `max_output_tokens`）；
+ * 2. 兜底 32 768。
+ *
+ * 客户端那套是三层的（`cYa(A,e) = j6r(e) ?? yTg(A)`，`yTg` 查
+ * `model_max_output_tokens` 的逐模型表再退 `default`），但那张表在本机
+ * **是空的**：它读环境变量 `QODER_CONFIG_MODEL_MAX_OUTPUT_TOKENS`，而
+ * `electronMain.js` 里根本不设置这个键（搜到 0 次）。所以官方客户端在同样
+ * 条件下发出的也是 32e3 —— 我们与它一致。
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 32_768
+
+/**
+ * 从上游 400 的报错文案里学 `max_tokens` 的实际上限。
+ *
+ * 抄的是 magpie（`packages/qoder/index.mjs` 的 `LEARNED_CAPS`）：上游对越界
+ * 值的回话是 `Range of max_tokens should be [1, N]`，把 N 取出来记住，下一次
+ * 就夹到 N 以内。这比猜一个上限稳 —— 上限会随模型变，而报错文案是上游自己说的。
+ */
+const MAX_TOKENS_RANGE_RE = /max_tokens[^0-9]{0,40}\[\s*\d+\s*,\s*(\d+)\s*\]/i
+
+/**
+ * 轮次表的容量上限。
+ *
+ * 表按**轮次**存一条短记录（id / begin_at / stage / end_at），512 轮也就几十 KB
+ * —— 这个数不是性能调优，是给「表不该无限长」一个明确上界。超出时淘汰**最早**
+ * 进来的那一轮（Map 插入序）。被淘汰的轮次不能再闭合（`closeTurn` 返回
+ * undefined），代价是那一轮在服务端靠 TTL 收口，而不是被记成别的阶段。
+ */
+const STAGE_MAP_LIMIT = 512
+
+/**
+ * 结束原因 → `business.stage` 终态。逐字照抄客户端 `kVe()`：
+ *
+ * ```js
+ * function kVe(e){switch(e){case"abort":case"repeated_tool_call_denied":return hpe;
+ *   case"error":case"max_turns":return gpe;case"end_turn":default:return fpe}}
+ * ```
+ *
+ * 即 `abort` / `repeated_tool_call_denied` → `abort`，`error` / `max_turns` →
+ * `error`，其余（含 `end_turn`）→ `complete`。**没有 `default` 之外的兜底值** ——
+ * 认不出的原因一律记为 `complete`，与客户端一致。
+ */
+function endStageOf(reason: QoderTurnEndReason): QoderBusinessStage {
+  switch (reason) {
+    case 'abort':
+    case 'repeated_tool_call_denied':
+      return 'abort'
+    case 'error':
+    case 'max_turns':
+      return 'error'
+    case 'end_turn':
+    default:
+      return 'complete'
+  }
+}
 
 export const QODER_REGIONS: Readonly<Record<QoderRegion, QoderRegionConfig>> = {
   cn: {
@@ -466,12 +616,79 @@ export interface QoderUpstreamOptions {
   /** 本机指纹盐（可选，混入派生种子）。 */
   installSalt?: string
   fetch?: typeof fetch
+  /**
+   * `business.product` 的取值（默认 {@link DEFAULT_BUSINESS_PRODUCT}）。
+   *
+   * 可配置是为了留一条**实测换值的口子**：`cli` 与 `app` 会让服务端把请求归进
+   * 不同产品线的记账，而哪一条才是「控制台里能看见消费行」的那条，还没有抓包
+   * 定论。写死就没法在不改代码的前提下验证另一条。
+   */
+  businessProduct?: QoderBusinessProduct
+  /** 上报给上游的 `business.version`（默认跟随 {@link clientVersion}）。 */
+  businessVersion?: string
+  /**
+   * 要不要给 system 消息打 `cache_control: ephemeral`（默认**不打**）。
+   *
+   * 默认关的理由见 {@link applyCacheControl} 的注释：真实客户端只对声明了
+   * `capabilities.cacheControl` 的模型才开，而那条路径只服务自定义 provider，
+   * Qoder 内建通道的缓存由服务端按 `session_id` 自动做。留这个口子是为了能做
+   * A/B 实测，不是因为它该默认开。
+   */
+  cacheControl?: { type: 'ephemeral'; ttl?: '1h' }
+  /**
+   * 向 Qoder 声明的**客户端版本**。给了就完全取代 {@link clientVersion} 的
+   * 自动发现（releases 接口 + 内置兜底）。
+   *
+   * 它会同时进 `cosy-version` 头、bearer 载荷的 `cosyVersion`、以及
+   * `business.version` —— 三处必须同值，所以只留一个入口。
+   */
+  clientVersion?: string
+  /**
+   * 设备身份来源模式（默认 `real`）。见 {@link QoderDeviceIdentityMode}。
+   *
+   * `real`：本机 `machine_id` 文件 + UMID 组件（取不到则逐字段退回派生）。
+   * `derived`：全部从凭据派生（1.27.x 及以前的旧行为）。
+   * `manual`：用 {@link identityOverride} 里填的值。
+   */
+  deviceIdentity?: QoderDeviceIdentityMode
+  /**
+   * 人工填写的设备身份字段。只在 `deviceIdentity: 'manual'` 时生效，
+   * 缺席的字段各自退回默认来源。
+   *
+   * **这是把双刃剑，默认不提供 UI 入口**：填别人的真实指纹等于伪造设备身份，
+   * 填不存在的值比填旧值更容易被筛出来。它的正当用途只有一个 —— 当本机
+   * identity 读取器在某个平台上失效时，让人工值顶上做对照实验。
+   */
+  identityOverride?: QoderIdentityOverride
 }
 
-/** cosy 会话 + 指纹的持有者（每次 jobToken 交换后重建）。 */
-export interface QoderSessionHolder {
+/** 一次轮次闭合需要的全部信息（由 `chatStream` 记下，`finishTurn` 取用）。 */
+export interface QoderTurnContext {
+  sessionId: string | undefined
+  /** 轮次表的键（空串 = 无法归组，不闭合）。 */
+  key: string
+  businessId: string
+  beginAt: number
+  name: string
+  modelKey: string
+  product: QoderBusinessProduct
+  version: string
+}
+
+/** 一轮结束时报告的终态原因，映射到客户端的 `kVe()`。 */
+export type QoderTurnEndReason = 'end_turn' | 'abort' | 'error' | 'max_turns' | 'repeated_tool_call_denied'
+
+/** cosy 会话 + 指纹的持有者（每次 jobToken 交换后重建）。 */export interface QoderSessionHolder {
   session: CosySessionContext
   fingerprint: CosyFingerprint
+  /**
+   * 本次会话实际采用的设备身份（含逐字段来源），见 `device-identity.ts`。
+   *
+   * 与 `fingerprint` 并存：`fingerprint` 仍然是「从凭据派生」的那一份（有调用方
+   * 依赖它做稳定的旧身份），`identity` 是**真正发出去**的那一份。两者可能不同，
+   * 差异由 `identity.source` 说明。
+   */
+  identity?: QoderDeviceIdentity
   jobToken: QoderJobToken
   /** 会话过期毫秒时间戳；0 表示未知。 */
   expireAtMs: number
@@ -503,17 +720,40 @@ export interface QoderSessionHolder {
 /**
  * cosy 面（chat + models）的公共请求头。
  *
- * 协议版本见 {@link COSY_CLIENT_TYPE} / {@link COSY_VERSION_HEADER}：这两个值
- * 决定上游下发哪套模型目录，改之前先读那段注释（issue #21 的实测表）。
+ * 协议版本见 {@link COSY_CLIENT_TYPE}：它决定上游下发哪套模型目录，改之前先读
+ * 那段注释（issue #21 的实测表 + 2026-11-21 抓包对 clienttype 的纠正）。
+ *
+ * `user-agent` 与 `cosy-business-product` 都是**抓包实测**的值：官方 CN CLI
+ * 1.1.94 发的是 `Bun/1.4.4`（它是 Bun 编译的单文件可执行程序）与 `cli`。
+ * 这里此前是 `Go-http-client/2.0` 与 `ide` —— 两个都不对：前者是早期照着
+ * 别人的 Go 实现抄的，后者是从网页版猜的（头名是真的，值不是）。
+ *
+ * ## `user-agent` 为什么是写死的常量，而不是像 `cosy-version` 那样动态解析
+ *
+ * 两者的性质不同，别把它们混成一条规则：
+ *
+ * | 头 | 含义 | 该不该动态 |
+ * | --- | --- | --- |
+ * | `cosy-version` | **Qoder CLI 自己的版本号** | 该 —— 它随 CLI 发布变化，且要在头、bearer 载荷、`business.version` 三处同值 |
+ * | `user-agent` | **编译出那个 CLI 的 Bun 运行时的版本** | 不该 —— 它与 CLI 的版本号没有对应关系，`1.4.4` 是 Bun 的版本，不是 Qoder 的 |
+ *
+ * 具体说：如果把它改成「跟随 `clientVersion`」，就会发出 `Bun/1.1.94` —— 那是
+ * 一个**从未存在过的 Bun 版本**。这恰恰是本仓库反复强调要避免的那类编造：
+ * 一个不存在的版本号比一个「旧但真实」的版本号更显眼。
+ *
+ * 它也不是「我们自己的 UA」：我们跑在 Node 上，但这条链路在协议上**扮演 CLI**，
+ * 所以它必须报 CLI 报的那个值。这与 `cosy-clienttype: 5` 是同一性质 ——
+ * 协议常量，不是运行时事实。Bun 真升级到 1.5 时这个值会变旧，那是可接受的
+ * 陈旧（旧值是合法历史）；编一个假值才是筛得出来的异常。
  */
 const DEFAULT_HEADERS: Record<string, string> = {
   'cosy-data-policy': 'agree',
   'content-type': 'application/json',
   'cosy-clienttype': COSY_CLIENT_TYPE,
   'login-version': 'v2',
-  'user-agent': 'Go-http-client/2.0',
+  'user-agent': 'Bun/1.4.4',
   'cosy-scene': 'assistant',
-  'cosy-business-product': 'ide',
+  'cosy-business-product': DEFAULT_BUSINESS_PRODUCT,
   'cosy-business-type': 'agent',
 }
 
@@ -539,12 +779,300 @@ export class QoderUpstreamClient {
   /** 最近使用的主会话（默认解析路径复用它）。 */
   private currentKey: string | undefined
 
+  /**
+   * 每条**用户轮次**的 `business` 生命周期：`id`、`begin_at`、`stage`、`endAt`。
+   *
+   * ## 粒度是「轮次」，不是「会话」，也不是「请求」（这条被实测纠正过两次）
+   *
+   * 官方客户端的 `AgentLifecycle`（`Mh` 类）在**每条用户提示**上 `create` 一次，
+   * `business.id` / `begin_at` 在这一轮的全部工具循环里不变，轮次结束时 `finalize`
+   * 写终态并 `POST /algo/api/v2/service/business/finish` 闭合。
+   *
+   * 实测抓包（qoderclicn 1.1.94，`business/finish` 次数恒为 1）：
+   *
+   * | 场景 | `agent_chat_generation` | `business/finish` |
+   * | --- | --- | --- |
+   * | 单轮、无工具 | 1 | 1 |
+   * | 单轮、1 次工具调用 | **3** | **1** |
+   * | 恢复会话后第二轮 | 1 | 1 |
+   *
+   * 即一次用户输入 → 一个 id → N 次补全（N 随工具调用增加）→ 结束时 1 次闭合。
+   *
+   * ## 走过的两条弯路（都别再走回去）
+   *
+   * 1. **每轮 `randomId()`**：最初这个字段和 `request_id` 一样每轮换新，注释还
+   *    写着「它们是单次请求标识」。那让一场会话在服务端被记成 N 条互不相干、
+   *    且从来没被结束过的记录 —— 控制台里一条消费行都不显示。
+   * 2. **整场会话固定**：随后的修法把 `id` 钉在 `session_id` 上。这同样不对：
+   *    会话里第 2、3 轮会复用第 1 轮的 id，服务端把整场会话记成**一条**永远
+   *    不闭合的记录，同样出不了逐轮消费行。
+   *
+   * 正确的键是「会话 + 该轮的用户输入」：同一轮的多次补全命中同一条，跨轮必然
+   * 不同；连用户连说两遍「继续」也是两条 —— 因为上一轮闭合时**这条记录已经从
+   * 表里删掉了**，第二轮必然新建。
+   *
+   * 表只在轮内存在，所以通常只有「正在跑的那几轮」几条记录；LRU 截断
+   * （{@link STAGE_MAP_LIMIT}）防的是「发出去了但轮末从未到来」的那些异常轮次
+   * 无限堆积。
+   */
+  private readonly turns = new Map<string, {
+    id: string
+    beginAt: number
+    stage: QoderBusinessStage
+  }>()
+
+  /**
+   * 已经闭合过的 `business.id`。重复闭合同一轮是**绝不**该发生的事：客户端
+   * 每轮只 `finalize()` 一次，多发一条 `BUSINESS_FINISH` 会让服务端对同一轮
+   * 记两次收口。
+   *
+   * 容量上限与轮次表同值（{@link STAGE_MAP_LIMIT}）。它只是幂等闸，不是账本：
+   * 被淘汰之后重复闭合才有可能漏过，而那时那条记录本来也已不在表里了。
+   */
+  private readonly endTurnClosed = new Set<string>()
+
+  /**
+   * 从上游报错里学到的 `max_tokens` 上限，按模型 key 缓存。
+   *
+   * 上游对越界值的回话是 `Range of max_tokens should be [1, N]`；学到 N 之后
+   * 后续请求直接夹到 N 以内，不再撞同一堵墙（magpie 的 `LEARNED_CAPS` 同法）。
+   */
+  private readonly maxTokensCaps = new Map<string, number>()
+
+  /** `business.product`（见 {@link DEFAULT_BUSINESS_PRODUCT}）。 */
+  private readonly businessProduct: QoderBusinessProduct
+  /** 显式配置的 `business.version`；缺席时跟随 {@link clientVersion}。 */
+  private readonly businessVersionOverride: string | undefined
+  /** 设备身份来源模式（见 {@link QoderUpstreamOptions.deviceIdentity}）。 */
+  private readonly deviceIdentity: QoderDeviceIdentityMode
+  /** 人工身份覆盖值（只在 `manual` 模式生效）。 */
+  private readonly identityOverride: QoderIdentityOverride | undefined
+  /** 客户端版本解析器：头、bearer 载荷、`business.version` 三处同源。 */
+  private readonly clientVersionResolver: ClientVersionResolver
+  /** prompt-cache 标记（默认 undefined = 不标记）。 */
+  private readonly cacheControl: { type: 'ephemeral'; ttl?: '1h' } | undefined
+
+  /**
+   * 这次请求该声明的客户端版本。
+   *
+   * 三处必须同值：`cosy-version` 头、bearer 载荷的 `cosyVersion`、
+   * `business.version`。取一次、用三处，避免它们各自漂移。
+   */
+  private get clientVersion(): string {
+    return this.clientVersionResolver.current()
+  }
+
+  /** `business.version`：显式配置优先，否则与客户端版本同值。 */
+  private get businessVersion(): string {
+    return this.businessVersionOverride ?? this.clientVersion
+  }
+
+  /**
+   * 某会话要发的设备身份头。
+   *
+   * 取值优先用会话里记下的那份 `identity`（`exchangeJobToken` 时解析出来的，
+   * 含逐字段来源）；没有就退回会话自己的三个字段 + 本机环境 —— 这条兜底是给
+   * 手工构造 holder 的测试用的。
+   *
+   * 环境头（`machineos` / `machinehostname`）**每次现取**，不缓存进 identity：
+   * 它们是「这台机器现在是什么」，不是身份的一部分。
+   */
+  private machineHeaders(holder: QoderSessionHolder): Record<string, string> {
+    const env = localMachineEnv()
+    const identity = holder.identity
+    if (identity !== undefined) return identityHeaders(identity, env)
+    return {
+      'cosy-machineid': holder.session.machineId,
+      'cosy-machinetoken': holder.session.machineToken,
+      'cosy-machinetype': holder.session.machineType,
+      'cosy-machineos': env.os,
+      'cosy-machinehostname': env.hostname,
+    }
+  }
+
+  /**
+   * 节点表缓存（按客户端 5 分钟 TTL）。
+   *
+   * 一个实例一份缓存：节点表是**按账号**下发的，跨账号复用会拿错表。
+   */
+  private readonly endpoints = new QoderEndpointCache()
+
+  /**
+   * 上次成功聊天的 inference 节点（用于「上次优先」，见 `orderWithLastFirst`）。
+   *
+   * 记住它不只是提速：节点之间不共享 KV cache，每轮跳节点等于每轮重算整段
+   * 历史。只有它失败时才换下一个。
+   */
+  private lastInferenceNode: string | undefined
+
+  /**
+   * 当前轮次的 business 上下文，供 {@link finishTurn} 闭合时取用。
+   *
+   * 一次 `chatStream` 只覆盖一次补全，而一轮用户提示可能包含 N 次补全（工具
+   * 循环），所以这里记的是**最近一次**补全所属的那一轮；`shim` 在这一轮的最后
+   * 一次补全（`finish_reason === 'stop'`）之后才调 {@link finishTurn}。
+   */
+  private currentTurn: QoderTurnContext | undefined
+
+  /**
+   * 取（或新建）本轮用户输入的 `business` 记录，并按客户端 `changeBusinessState()`
+   * 推进阶段。
+   *
+   * ## 键为什么是「会话 + 用户提示」
+   *
+   * 客户端里 `business.id` 就是**这条用户消息的 `requestSetId`**
+   * （`Mh.create(sessionId, …, userMessage.requestSetId, …)` → `Fz` 的
+   * `id: o || randomUUID()`）。所以粒度是**一条用户输入一条记录**，
+   * 一条输出了 prompt 之后那一串工具循环里的 N 次补全共用同一个 id。
+   *
+   * 我们这边没有宿主的 `requestSetId`，可用且等价的锚点是「会话 + 最近一条用户
+   * 提示」：一轮工具循环里最后一条 user 消息**不变**，下一轮用户输入一定会变。
+   * 键里带上提示文本，就是为了让「同一个会话里问了两遍一样的话」也得到两条
+   * 记录 —— 靠会话内序号做不到这一点（序号要等闭合才知道，而闭合只在轮末）。
+   *
+   * ## 阶段推进
+   *
+   * 规则照抄客户端 `Mh`：`init`/首次 → `start`，之后 → `processing`，再之后保持
+   * `processing`（客户端的第三个分支只 warn、不再推进）。**终态不在这里推进** ——
+   * 客户端由 `finalize()` 在轮次结束时一次写定，对应到我们这边是
+   * {@link finishTurn}。
+   *
+   * 会话标识或缺席提示时无法归组 —— 每次都是一条新的 `start` 记录，至少不会
+   * 声称一个错的阶段（宁可少聚合，不可错聚合）。
+   */
+  private sessionOf(
+    sessionId: string | undefined,
+    prompt: string,
+  ): { key: string; id: string; beginAt: number; stage: QoderBusinessStage } {
+    if (sessionId === undefined || sessionId === '') {
+      return { key: '', id: randomId(), beginAt: Date.now(), stage: 'start' }
+    }
+    const key = `${sessionId}\u0000${prompt}`
+    const existing = this.turns.get(key)
+    if (existing === undefined) {
+      // 新建时照客户端 `Fz` 写 `init`，但**首个请求发出的是 `start`** ——
+      // `AgentLoop` 在发请求前先调一次 `changeBusinessState()`，那一下就把
+      // `init` 推进成了 `start`。少走这一步会让每个轮次的开头多出一条
+      // 永远不会被发出去的 `init` 状态。
+      const fresh = { id: randomId(), beginAt: Date.now(), stage: 'start' as QoderBusinessStage }
+      this.rememberTurn(key, fresh)
+      return { key, ...fresh }
+    }
+    // `init` 与 `start` 都要走到 `processing`；已经是后续阶段就保持原样。
+    const advanced: typeof existing = existing.stage === 'init' || existing.stage === 'start'
+      ? { ...existing, stage: 'processing' }
+      : existing
+    this.rememberTurn(key, advanced)
+    return { key, id: advanced.id, beginAt: advanced.beginAt, stage: advanced.stage }
+  }
+
+  /**
+   * 结束当前轮次：写终态与 `end_at`，并**把这条记录从表里删掉**。
+   *
+   * 删除（而不是留在表里加个「已闭合」标记）是「一条用户输入 = 一条消费记录」
+   * 能成立的关键：留着的话，下一轮若用户问了同样的话，会命中同一个键、并进
+   * 上一条已闭合的记录里 —— 那正是「整场会话固定 id」那种错法的变体，只是
+   * 晚一轮才发作。删掉之后下一次必然新建，`id` 与 `begin_at` 都是新的。
+   *
+   * 返回 `undefined` = 这一轮已经闭合过（或被 LRU 淘汰），调用方据此跳过上报。
+   * 这个判据落在 `business.id` 上而不是轮次表上：`finishTurn` 也允许调用方直接
+   * 递一个轮次上下文过来（测试与外部调用就是这条路），那时表里根本没有记录，
+   * 拿「表里有没有」当闸会把合法的闭合挡掉。
+   *
+   * 终态取值照客户端 `kVe()`：`abort`/`repeated_tool_call_denied` → `abort`，
+   * `error`/`max_turns` → `error`，其余（含 `end_turn`）→ `complete`。
+   */
+  private closeTurn(
+    sessionId: string | undefined,
+    key: string,
+    businessId: string,
+    fallbackBeginAt: number,
+    stage: QoderBusinessStage,
+  ): { id: string; beginAt: number; stage: QoderBusinessStage; endAt: number } | undefined {
+    if (businessId === '') return undefined
+    // 幂等闸：同一个 id 只闭合一次。`endTurnClosed` 是有界的（见其注释），
+    // 重复闭合同一轮既不会重发也不会无限占内存。
+    if (this.endTurnClosed.has(businessId)) return undefined
+    this.endTurnClosed.add(businessId)
+    while (this.endTurnClosed.size > STAGE_MAP_LIMIT) {
+      const oldest = this.endTurnClosed.values().next()
+      if (oldest.done === true) break
+      this.endTurnClosed.delete(oldest.value)
+    }
+    // 表里有就取它的 `begin_at`（那才是这一轮真正开始的时间）；没有就用调用方
+    // 递过来的那一份 —— 后者可能是从 chatStream 之外构造的上下文。
+    const entry = sessionId === undefined || key === '' ? undefined : this.turns.get(key)
+    if (sessionId !== undefined && key !== '') this.turns.delete(key)
+    return {
+      id: businessId,
+      beginAt: entry?.beginAt ?? fallbackBeginAt,
+      stage,
+      endAt: Date.now(),
+    }
+  }
+
+  /** 写轮次记录并按 LRU 截断（Map 的插入序即访问序，重插一次即可上浮）。 */
+  private rememberTurn(
+    key: string,
+    entry: { id: string; beginAt: number; stage: QoderBusinessStage; endAt?: number },
+  ): void {
+    this.turns.delete(key)
+    this.turns.set(key, entry)
+    while (this.turns.size > STAGE_MAP_LIMIT) {
+      const oldest = this.turns.keys().next()
+      if (oldest.done === true) break
+      this.turns.delete(oldest.value)
+    }
+  }
+
+  /**
+   * 决定本次请求的 `max_tokens`：调用方给的 → 学到的上限夹一下。
+   *
+   * 三层里的第三层（客户端的逐模型 override 表）在本机是空的，所以这里只有
+   * 「调用方值（来自 `/model/list` 的 `max_output_tokens`）」与兜底常量两层。
+   */
+  private maxTokensFor(modelKey: string, requested: number | undefined): number {
+    const base = requested !== undefined && Number.isFinite(requested) && requested > 0
+      ? Math.floor(requested)
+      : DEFAULT_MAX_OUTPUT_TOKENS
+    const learned = this.maxTokensCaps.get(modelKey)
+    return learned === undefined ? base : Math.min(base, learned)
+  }
+
+  /**
+   * 从上游报错文案里学 `max_tokens` 的实际上限。
+   *
+   * 只在确实认出了 `[1, N]` 形状时记 —— 认不出就不动，绝不猜一个更小的值
+   * （猜小了会让回答被提前截断，而截断是静默的）。
+   */
+  private learnMaxTokens(modelKey: string, errorText: string): void {
+    const match = MAX_TOKENS_RANGE_RE.exec(errorText)
+    if (match?.[1] === undefined) return
+    const cap = Number(match[1])
+    if (!Number.isSafeInteger(cap) || cap <= 0) return
+    if (this.maxTokensCaps.get(modelKey) === cap) return
+    this.maxTokensCaps.set(modelKey, cap)
+    this.log(`上游申报 max_tokens 上限 ${cap}（模型 ${modelKey}），后续请求夹到该值以内`)
+  }
+
   constructor(region: QoderRegion, options: QoderUpstreamOptions = {}) {
     this.region = QODER_REGIONS[region]!
     this.regionKey = region
     this.logger = options.logger ?? (() => {})
     this.installSalt = options.installSalt
     this.fetchImpl = options.fetch ?? globalThis.fetch
+    this.businessProduct = options.businessProduct ?? DEFAULT_BUSINESS_PRODUCT
+    this.businessVersionOverride = options.businessVersion !== undefined && options.businessVersion !== ''
+      ? options.businessVersion
+      : undefined
+    this.deviceIdentity = options.deviceIdentity ?? 'real'
+    this.identityOverride = options.identityOverride
+    this.clientVersionResolver = new ClientVersionResolver(
+      options.clientVersion !== undefined && options.clientVersion !== ''
+        ? { override: options.clientVersion, ...(options.fetch === undefined ? {} : { fetchImpl: options.fetch }) }
+        : (options.fetch === undefined ? {} : { fetchImpl: options.fetch }),
+    )
+    this.cacheControl = options.cacheControl
   }
 
   private log(message: string): void {
@@ -567,28 +1095,37 @@ export class QoderUpstreamClient {
 
   /**
    * 用 PAT（`pt-...` 或任意凭证）或 refresh token（`drt-...`）交换 jobToken。
-   * 设备指纹以凭证为种子派生（无 uid 可用前），保证稳定。
+   *
+   * 设备身份不再是「整份从凭据派生」：见 {@link resolveDeviceIdentity}。默认
+   * 模式下 `machineId` 读本机 `machine_id` 文件、`machineToken/Type/Code` 读
+   * UMID 组件，任何一路取不到才退回派生值并记录原因。
    */
   async exchangeJobToken(credential: string): Promise<QoderJobToken> {
     const fingerprint = deriveFingerprint('', credential, this.installSalt)
+    const device = await resolveDeviceIdentity({
+      region: this.regionKey,
+      credential,
+      mode: this.deviceIdentity,
+      ...(this.identityOverride === undefined ? {} : { override: this.identityOverride }),
+      ...(this.installSalt === undefined ? {} : { installSalt: this.installSalt }),
+      log: message => this.log(message),
+    })
     const body = jobTokenBody(credential)
     const date = currentRfc1123Date()
     const sig = signLegacy(date)
 
     const headers: Record<string, string> = {
-      'cosy-machinetoken': fingerprint.machineToken,
-      'cosy-machinetype': fingerprint.machineType,
+      ...identityHeaders(device),
       'login-version': 'v2',
       appcode: 'cosy',
       accept: 'application/json',
       'accept-encoding': 'identity',
-      'cosy-version': COSY_VERSION_HEADER,
+      'cosy-version': this.clientVersion,
       'cosy-clienttype': COSY_CLIENT_TYPE,
       date,
       signature: sig,
       'content-type': 'application/json',
-      'cosy-machineid': fingerprint.machineId,
-      'user-agent': 'Go-http-client/2.0',
+      'user-agent': DEFAULT_HEADERS['user-agent'] ?? 'Bun/1.4.4',
     }
 
     const url = `${this.region.gateway}${this.region.jobTokenPath}`
@@ -615,10 +1152,11 @@ export class QoderUpstreamClient {
       throw new QoderUpstreamError('auth', `jobToken 交换响应缺少身份字段: ${truncate(text, 200)}`, resp.status)
     }
     const identity = { name: jobToken.name, aid: jobToken.id, uid: jobToken.id, yx_uid: '', organization_id: '', organization_name: '', user_type: jobToken.userType, security_oauth_token: jobToken.securityOauthToken, refresh_token: jobToken.refreshToken }
-    const session = newCosySession(identity, fingerprint.machineId, fingerprint.machineToken, fingerprint.machineType)
+    const session = newCosySession(identity, device.machineId, device.machineToken, device.machineType)
     const holder: QoderSessionHolder = {
       session,
       fingerprint,
+      identity: device,
       jobToken,
       expireAtMs: jobToken.expireTime > 0 ? jobToken.expireTime : 0,
     }
@@ -705,12 +1243,66 @@ export class QoderUpstreamClient {
   }
 
   /**
+   * 取一份可用的节点表，失败时静默返回 undefined。
+   *
+   * **绝不因为发现失败就挡住聊天**：客户端对选举只给 1 秒（`NCn=2e3` / `1e3`），
+   * 超时就退回环境默认端点继续跑。这里同法 —— 发现是优化，不是前置条件。
+   *
+   * 请求本身走 center 主机（即本区域的 `openapi` 主机：客户端的 `ste()` 返回
+   * `Rp("center")`，`Gde` 里 center 与 openapi 指向同一台 `$9`）；鉴权与
+   * `fetchModels` 一样用 bearer。失败原因只记 debug 级别 —— 它是常态，不是故障。
+   */
+  private async discoverNodes(holder: QoderSessionHolder, signal?: AbortSignal): Promise<void> {
+    if (this.endpoints.isFresh()) return
+    const url = `${this.region.openapi}${REGION_ENDPOINTS_PATH}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error('endpoint election timed out')), ENDPOINTS_TIMEOUT_MS)
+    // 调用方的取消也要生效：否则一场被取消的对话还要多挂 1 秒的发现请求。
+    const onAbort = (): void => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      const data = await this.bearerGet(holder, url, controller.signal)
+      const parsed = parseRegionEndpoints(data)
+      if (parsed === undefined) {
+        this.log(`节点表为空或形状不识别（${REGION_ENDPOINTS_PATH}），继续用默认网关`)
+        return
+      }
+      this.endpoints.write(parsed)
+    } catch (error) {
+      // 发现是优化项：任何失败都退回默认网关，不向调用方冒泡。
+      this.log(`节点发现失败，继续用默认网关：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * 本次聊天该用的 base URL（**不带尾斜杠**）。
+   *
+   * 顺序：上次成功的 inference 节点 → 节点表里的第一个 → 区域默认网关。前两个都
+   * 来自节点发现，最后一个保证**永远有一个能用的**。
+   *
+   * 统一去掉尾斜杠：节点表里的 URL 被规范成带尾斜杠（`normalizeNodeUrl`），而
+   * `region.gateway` 不带。不归一的话拼 `chatPath`（以 `/` 开头）就会出现
+   * `//api/...` 双斜杠 —— 它能不能被容忍取决于网关，不该赌。
+   */
+  private chatBaseUrl(): string {
+    const nodes = this.endpoints.read()?.inference ?? []
+    const ordered = orderWithLastFirst(nodes, this.lastInferenceNode)
+    return (ordered[0] ?? this.region.gateway).replace(/\/+$/, '')
+  }
+
+  /**
    * 拉取模型目录。响应形状（服务端 snake_case）：
    * `{"chat":[{key, display_name, enable, is_vl, is_default, ...}], ...}`
    */
   async fetchModels(credential: string, signal?: AbortSignal): Promise<QoderUpstreamModel[]> {
     const holder = await this.ensureSession(credential)
-    const url = `${this.region.gateway}${this.region.modelsPath}`
+    // 目录同样可能按节点分区下发；先尝试发现，失败就用默认网关（见 discoverNodes）。
+    await this.discoverNodes(holder, signal)
+    const modelsBase = this.endpoints.read()?.openapi[0] ?? `${this.region.gateway}/`
+    const url = `${modelsBase.replace(/\/$/, '')}${this.region.modelsPath}`
     const data = await this.bearerGet(holder, url, signal)
     const chat = Array.isArray(data.chat) ? data.chat : []
     return chat
@@ -776,6 +1368,17 @@ export class QoderUpstreamClient {
        */
       reasoningEffort?: string
       isVl?: boolean
+      /**
+       * 该模型的输出上限（token），来自上游 `/model/list` 的 `max_output_tokens`。
+       *
+       * **必须下发。** 官方客户端的每个请求都带 `parameters.max_tokens`
+       * （`lYa(A)` 里无条件写），而此前这里从不发 —— 等于让上游自己随便挑一个
+       * 默认值，用户设置的输出预算完全不生效。
+       *
+       * 缺席时退回 {@link DEFAULT_MAX_OUTPUT_TOKENS}（与客户端 `defaultTokens`
+       * 同值），不是「不发这个字段」。
+       */
+      maxOutputTokens?: number
       signal?: AbortSignal
       onDelta: (delta: QoderChatDelta) => void
       userType?: string
@@ -791,19 +1394,27 @@ export class QoderUpstreamClient {
     const holder = await this.ensureSession(credential)
     const template = deepClone(createChatBodyTemplate())
     applyModelKey(template, modelKey, options.userType ?? holder.jobToken.userType, options.isVl ?? false)
+    // 会话类型按区域取：国内版是 `qoderclicn`，国际版是 `qodercli`。
+    template.session_type = sessionTypeOf(this.regionKey)
     if (options.isReasoning) {
       template.model_config.is_reasoning = true
       template.chat_context.extra.modelConfig.is_reasoning = true
     }
+    // 参数袋一次成型：reasoning_effort 与 max_tokens 都写在这里。
+    //
+    // 两者以前是分开写的（reasoning_effort 独自 `{...params, ...}`），所以先算
+    // 出完整的一份再赋值，避免后写的覆盖先写的。
+    const maxTokens = this.maxTokensFor(modelKey, options.maxOutputTokens)
+    const params = (template.parameters ?? {}) as Record<string, unknown>
+    template.parameters = { ...params, max_tokens: maxTokens }
     if (options.reasoningEffort !== undefined && options.reasoningEffort !== '') {
       // 两个位置都写：官方客户端如此，照抄以避免网关只认其中一个。
       template.reasoningEffort = options.reasoningEffort
-      const params = (template.parameters ?? {}) as Record<string, unknown>
-      template.parameters = { ...params, reasoning_effort: options.reasoningEffort }
+      template.parameters = { ...(template.parameters as Record<string, unknown>), reasoning_effort: options.reasoningEffort }
     }
     const prompt = extractLatestUserPrompt(messages)
     const built = buildQoderMessages(messages, prompt, Array.isArray(options.tools) && options.tools.length > 0)
-    template.messages = built as unknown as unknown[]
+    template.messages = applyCacheControl(built, this.cacheControl) as unknown as unknown[]
     if (options.tools !== undefined) {
       template.tools = options.tools
     }
@@ -812,49 +1423,112 @@ export class QoderUpstreamClient {
     template.request_set_id = randomId()
     // issue #42：`session_id` 是「会话」标识，不是单次请求标识 —— 它在同一场
     // 会话内必须稳定，否则 Qoder 的 prompt cache 每轮换桶、100% 失效，长对话
-    // 每轮都为整段历史重复付全价。request_id / request_set_id / business.id
-    // 每轮换新仍然正确（它们是单次请求标识）。
+    // 每轮都为整段历史重复付全价。request_id / request_set_id 每轮换新仍然
+    // 正确（它们是单次请求标识）。
+    //
+    // ⚠️ `business.id` 是**轮次**记录而不是单次请求标识，也不该钉在整场会话上。
+    // 它此前每轮换新（一场会话被记成 N 条互不相干的记录），中间一版改成按
+    // `session_id` 固定（整场会话被记成 1 条永不闭合的记录）—— 两种都出不了
+    // 逐轮消费行。正确粒度见 `sessionOf` 上方那张实测表。
     template.session_id = options.sessionId !== undefined && options.sessionId !== ''
       ? options.sessionId
       : randomId()
-    template.business.id = randomId()
+    const turn = this.sessionOf(template.session_id, prompt)
+    applyBusinessIdentity(template, {
+      product: this.businessProduct,
+      version: this.businessVersion,
+      stage: turn.stage,
+      modelKey,
+    })
+    template.business.id = turn.id
+    template.business.begin_at = turn.beginAt
     template.business.name = prompt.slice(0, 30) || 'hi'
-    template.business.begin_at = Date.now()
-
-    const body = JSON.stringify(template)
-    const url = `${this.region.gateway}${this.region.chatPath}`
-    const pathSig = pathSigFrom(url)
-
-    const encoded = cosyEncode(new TextEncoder().encode(body))
-    const date = String(Math.floor(Date.now() / 1000))
-    const payloadB64 = buildPayloadB64(holder.session.info)
-    const sig = signRequest(payloadB64, holder.session.cosyKey, date, encoded, pathSig)
-    const bearer = composeBearer(payloadB64, sig)
-
-    const headers: Record<string, string> = {
-      ...DEFAULT_HEADERS,
-      'cosy-machinetype': holder.session.machineType,
-      'cosy-date': date,
-      'cosy-user': holder.session.identity.uid,
-      'cosy-key': holder.session.cosyKey,
-      'cache-control': 'no-cache',
-      accept: 'text/event-stream',
-      authorization: bearer,
-      'cosy-version': COSY_VERSION_HEADER,
-      'cosy-machineid': holder.session.machineId,
-      'cosy-machinetoken': holder.session.machineToken,
-      'x-model-key': modelKey,
-      'x-model-source': 'system',
+    this.currentTurn = {
+      sessionId: options.sessionId,
+      key: turn.key,
+      businessId: turn.id,
+      beginAt: turn.beginAt,
+      name: template.business.name,
+      modelKey,
+      product: this.businessProduct,
+      version: this.businessVersion,
     }
 
-    const resp = await this.fetchImpl(url, {
-      method: 'POST',
-      headers,
-      body: encoded,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    })
+    const body = JSON.stringify(template)
+    // 先发现节点（失败静默退回默认网关），再决定这次打哪个 inference 节点。
+    await this.discoverNodes(holder, options.signal)
+    const chatBase = this.chatBaseUrl()
+
+    /**
+     * 按某个 base 发出一次聊天请求。
+     *
+     * `pathSig` 与 `cosy-date` 都**依赖最终 URL**（签名覆盖路径），所以每换一个
+     * base 就必须重新签一次 —— 不能复用上一份 header 换个 host 发出去，那样网关
+     * 会判签名不匹配。这也正是把它写成闭包而不是循环的原因。
+     */
+    const send = async (base: string): Promise<Response> => {
+      const url = `${base}${this.region.chatPath}`
+      const pathSig = pathSigFrom(url)
+      const encoded = cosyEncode(new TextEncoder().encode(body))
+      const date = String(Math.floor(Date.now() / 1000))
+      const payloadB64 = buildPayloadB64(holder.session.info, this.clientVersion)
+      const sig = signRequest(payloadB64, holder.session.cosyKey, date, encoded, pathSig)
+      const bearer = composeBearer(payloadB64, sig)
+
+      const headers: Record<string, string> = {
+        ...DEFAULT_HEADERS,
+        'cosy-machinetype': holder.session.machineType,
+        'cosy-date': date,
+        'cosy-user': holder.session.identity.uid,
+        'cosy-key': holder.session.cosyKey,
+        'cache-control': 'no-cache',
+        accept: 'text/event-stream',
+        authorization: bearer,
+        'cosy-version': this.clientVersion,
+        'x-model-key': modelKey,
+        'x-model-source': 'system',
+        // 四件套 + `machineos` + `machinehostname`：官方 CLI 每次聊天都带这六个，
+        // 此前只发了前三个（且取值不对）。见 `identityHeaders` 的注释。
+        ...this.machineHeaders(holder),
+      }
+
+      return this.fetchImpl(url, {
+        method: 'POST',
+        headers,
+        body: encoded,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      })
+    }
+
+    // 选举来的节点**没有**「用户网络一定能通」这个保证（默认网关有：用户就是
+    // 靠它配上 PAT 的）。国内访问国际版、或企业网络只放行网关域名时，连接会
+    // 直接抛在网络层。纯优化功能不能把「一直能用」变成「全挂」，所以这里对
+    // **网络层异常**兜回默认网关重发一次。
+    //
+    // 只兜「抛异常」这一种：HTTP 4xx/5xx 是节点自己给的答复，说明连通性没问题，
+    // 那属于业务失败（配额、凭据、限流），换节点重发只会把同一个错误再问一遍，
+    // 还可能把一次配额错误放大成两次计费。
+    let resp: Response
+    /** 实际发出这次请求的 base（用于记录「这个节点可用」）。 */
+    let usedBase = chatBase
+    try {
+      resp = await send(chatBase)
+    } catch (error) {
+      const fallback = this.region.gateway
+      if (chatBase === fallback || isAbortError(error)) throw error
+      this.log(`节点 ${chatBase} 不可达（${error instanceof Error ? error.message : String(error)}），改用默认网关`)
+      // 记下坏节点，下一轮别又选它 —— 否则每轮都要白等一次超时。
+      this.lastInferenceNode = undefined
+      this.endpoints.clear()
+      resp = await send(fallback)
+      usedBase = fallback
+    }
     if (resp.status !== 200) {
       const errText = await resp.text()
+      // 400 可能是 `max_tokens` 越界（`Range of max_tokens should be [1, N]`）。
+      // 认出形状就把 N 记住，后续请求夹到它以内 —— 重试之前先学会，一次撞墙
+      // 换后面的顺。这不是猜：N 是上游自己在报错里写的。
+      this.learnMaxTokens(modelKey, errText)
       // 用 classifyFailure 而不是 classifyHttpStatus：chat 面的「当日用量用尽」
       // 就是从这里进来的（实测 HTTP 403 + body `{"code":"110",…}`），只看状态会
       // 把它判成凭据被拒，进而把好的账号永久踢出池。
@@ -872,6 +1546,14 @@ export class QoderUpstreamClient {
     }
     if (!resp.body) {
       throw new QoderUpstreamError('transient', '聊天响应没有 body')
+    }
+    // 首包已经回来，说明这个节点可用 —— 记下它，下一轮继续用它。
+    //
+    // 这一步放在 `!resp.body` 之后而不是 fetch 之后：一个 200 但空 body 的响应
+    // 不能算「这个节点好」，否则会把后续轮次钉在一个坏节点上。走回退分支时这里
+    // 记的是默认网关（`usedBase`），不是那个不可达的节点。
+    if (this.endpoints.read() !== undefined) {
+      this.lastInferenceNode = usedBase
     }
 
     const reader = resp.body.getReader()
@@ -982,8 +1664,156 @@ export class QoderUpstreamClient {
   }
 
   /**
-   * 活动列表（`GET /sash/api/v1/me/campaigns?forceRefresh=true`）。
+   * 闭合**最近一次** `chatStream` 所属的轮次。供 `shim` 在轮次真正结束时调用。
    *
+   * 与 {@link finishTurn} 的分工：那个是「给我一个轮次上下文，我来闭合」，这个
+   * 是「把刚才那次请求所属的轮次闭合掉」，省得把 `QoderTurnContext` 泄漏到
+   * 调用方去。
+   *
+   * 并发的两个会话会互相覆盖 `currentTurn` —— 但 `closeTurn` 按轮次键去重，且
+   * 每个键只闭合一次，所以最坏情况是**漏闭合**（该轮靠 TTL 收口），不会把
+   * A 会话的 id 配到 B 会话的终态上：`turn.sessionId` 与 `turn.key` 是同一次
+   * 请求里一起记下的，不存在错配的可能。
+   */
+  async finishCurrentTurn(credential: string, reason: QoderTurnEndReason = 'end_turn'): Promise<void> {
+    const turn = this.currentTurn
+    if (turn === undefined) return
+    await this.finishTurn(credential, turn, reason)
+  }
+
+  /**
+   * 闭合当前轮次：把终态与 `end_at` 写进请求体，`POST business/finish`。
+   *
+   * ## 为什么必须有这一步
+   *
+   * 官方客户端在一轮用户提示结束时**必发一次**闭合（实测：一轮 2 次补全仍是
+   * 1 次闭合）。不发它，服务端只能等 TTL 释放租约 —— 那一轮在记账上永远是
+   * 「进行中」，控制台也就不产生逐条消费行。这是本插件长期缺失的一环。
+   *
+   * ## 三道闸（照抄客户端 `Qd.finish()`）
+   *
+   * 1. 没有 `business.id` → 不发（客户端 `if (!businessInfo.id) return`）；
+   * 2. 子 agent 的轮次 → 不发（客户端 `if (this._isSubagent) return`；我们这里
+   *    没有子 agent 概念，由调用方保证只对主轮次调用）；
+   * 3. 同一轮已被闭合过 → 不发（客户端每轮 `finalize` 一次）。
+   *
+   * ## 为什么少了 `sub_task` / `orphan` / `feature_switches`
+   *
+   * 客户端 `Qd.finish()` 的模板里有这三个键，但**实测抓包里它们不出现**。
+   * 不是我们漏了 —— 它们在客户端那边本来就是 `undefined`：
+   *
+   * - `sub_task`：只有子 agent / `title_generation` 这类任务才由 `$o()` 填值，
+   *   主对话永远是 `undefined`；
+   * - `orphan`：只在 `createForSubagent` 找不到父 business 时置 `true`，
+   *   主轮次不带；
+   * - `feature_switches`：来自 `envInfo` 的账号级开关，我们这条 PAT 链路拿不到，
+   *   也不该编。
+   *
+   * `JSON.stringify` 会把 `undefined` 值整个省掉，所以官方 CLI 的明文里根本没
+   * 这三项。解密 `captures/20261121-050020` 的 `0039-req.bin` 可以逐字核对：
+   * 它的 `business` 只有九个键（product / version / type / id / model_key /
+   * begin_at / end_at / stage / name），与本函数发出的完全一致。
+   *
+   * 所以这里**刻意不写**这三个键：手写一个 `feature_switches: {}` 或
+   * `orphan: false` 反而会造出一项官方客户端不发的内容，那才是偏差。
+   *
+   * ## **不抛**
+   *
+   * 闭合失败只影响「记账何时收口」，不该让已经把答案交给用户的请求变成失败。
+   * 失败按 warn 记一条日志 —— 它必须是**可见的**，否则「消费行还是不出现」
+   * 会退化成又一个查不出来的问题。
+   */
+  async finishTurn(
+    credential: string,
+    turn: QoderTurnContext,
+    reason: QoderTurnEndReason = 'end_turn',
+  ): Promise<void> {
+    // 闸 1：没有 id 或无法归组，不发。
+    if (turn.businessId === '' || turn.key === '') return
+    const stage = endStageOf(reason)
+    const closed = this.closeTurn(turn.sessionId, turn.key, turn.businessId, turn.beginAt, stage)
+    // 闸 3：这一轮已经被闭合过（或已被 LRU 淘汰）。
+    if (closed === undefined) return
+
+    let holder: QoderSessionHolder
+    try {
+      holder = await this.ensureSession(credential)
+    } catch (error: unknown) {
+      this.log(`轮次闭合跳过（会话不可用）：${String((error as Error)?.message ?? error)}`)
+      return
+    }
+
+    const body = JSON.stringify({
+      // **双层信封**：明文是 `{payload, encodeVersion}`，`payload` 才是那个 JSON
+      // **字符串**（不是对象）。这一层单靠读客户端源码很容易看漏 ——
+      // `Qd.finish()` 里先 `.json({payload: JSON.stringify(w), encodeVersion:"1"})`，
+      // 再交给 `withWasmSigning()`，中间的变换不在同一处。
+      //
+      // 实测证据：解出的官方 CLI 闭合明文（captures/20261121-050020 的
+      // `0039-req.bin`，解密后 522 B）逐字就是
+      // `{"payload":"{\"event_time\":…}","encodeVersion":"1"}`。
+      //
+      // 发错这一层的后果不是「字段被忽略」，而是**整个请求 500**
+      // （`msgCode:500, Internal Server Error`）—— 服务端拿不到它认识的信封。
+      payload: JSON.stringify({
+        event_time: Date.now(),
+        event_type: 'BUSINESS_FINISH',
+        aid: '',
+        rid: randomId(),
+        oid: '',
+        yid: '',
+        uid: '',
+        event_data: {
+          session_id: turn.sessionId,
+          business: {
+            product: turn.product,
+            version: turn.version,
+            type: 'agent',
+            id: closed.id,
+            model_key: turn.modelKey,
+            begin_at: closed.beginAt,
+            end_at: closed.endAt,
+            stage: closed.stage,
+            name: turn.name,
+          },
+        },
+      }),
+      encodeVersion: '1',
+    })
+
+    try {
+      const base = this.chatBaseUrl()
+      const url = `${base}${FINISH_PATH}`
+      const pathSig = pathSigFrom(url)
+      const encoded = cosyEncode(new TextEncoder().encode(body))
+      const date = String(Math.floor(Date.now() / 1000))
+      const payloadB64 = buildPayloadB64(holder.session.info, this.clientVersion)
+      const sig = signRequest(payloadB64, holder.session.cosyKey, date, encoded, pathSig)
+      const resp = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          ...DEFAULT_HEADERS,
+          'cosy-date': date,
+          'cosy-user': holder.session.identity.uid,
+          'cosy-key': holder.session.cosyKey,
+          accept: '*/*',
+          authorization: composeBearer(payloadB64, sig),
+          'cosy-version': this.clientVersion,
+          ...this.machineHeaders(holder),
+        },
+        body: encoded,
+      })
+      if (resp.status !== 200) {
+        const text = await resp.text().catch(() => '')
+        this.log(`轮次闭合失败: HTTP ${resp.status} ${truncate(text, 200)}`)
+      }
+    } catch (error: unknown) {
+      this.log(`轮次闭合失败: ${String((error as Error)?.message ?? error)}`)
+    }
+  }
+
+  /**
+   * 活动列表（`GET /sash/api/v1/me/campaigns?forceRefresh=true`）。
    * 协议来自社区参考实现（L0NE-6/Qoder-Daily），已在本机 CN 账号实测通过：
    * `GET {openapi}/sash/api/v1/me/campaigns?forceRefresh=true`，认证用与用量
    * 查询同一套 `jt-` 令牌（`jobToken.securityOauthToken`）。
@@ -1193,21 +2023,19 @@ export class QoderUpstreamClient {
 
   private async bearerGet(holder: QoderSessionHolder, url: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const pathSig = pathSigFrom(url)
-    const payloadB64 = buildPayloadB64(holder.session.info)
+    const payloadB64 = buildPayloadB64(holder.session.info, this.clientVersion)
     const date = String(Math.floor(Date.now() / 1000))
     const sig = signRequest(payloadB64, holder.session.cosyKey, date, '', pathSig)
     const bearer = composeBearer(payloadB64, sig)
     const headers: Record<string, string> = {
       ...DEFAULT_HEADERS,
-      'cosy-machinetype': holder.session.machineType,
       'cosy-date': date,
       'cosy-user': holder.session.identity.uid,
       'cosy-key': holder.session.cosyKey,
       accept: 'application/json',
       authorization: bearer,
-      'cosy-version': COSY_VERSION_HEADER,
-      'cosy-machineid': holder.session.machineId,
-      'cosy-machinetoken': holder.session.machineToken,
+      'cosy-version': this.clientVersion,
+      ...this.machineHeaders(holder),
     }
     const resp = await this.fetchImpl(url, {
       headers,
@@ -1937,4 +2765,15 @@ function parseJson(text: string): unknown {
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`
+}
+
+/**
+ * 这次失败是不是「用户/宿主主动取消」。
+ *
+ * 取消必须**原样抛出**：它不是一个可以换节点重试的失败，退回默认网关再发一遍
+ * 只会让一场已经结束的对话多打一次上游（还可能计一次费）。`signal.reason` 在
+ * 不同运行时里是 `DOMException` 或普通 `Error`，所以按 `name` 判而不按类型。
+ */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
 }

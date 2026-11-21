@@ -52,12 +52,104 @@ export interface QoderChatTemplate {
   /** 上游透传参数袋（含 `reasoning_effort`）。 */
   parameters?: Record<string, unknown>
   messages: unknown[]
-  business: {
-    id: string
-    name: string
-    begin_at: number
-  }
+  /**
+   * 会话/任务记录。字段集合照抄官方客户端的 `business`（见 {@link QoderBusiness}）。
+   *
+   * 以前这里只有 `{id, name, begin_at}` —— 于是请求体里**没有** `product` /
+   * `type` / `version` / `stage`，平台那条「会话记录」路径认不出这是什么产品
+   * 发来的什么阶段的任务。缺字段不会报错（对话照常跑），只在**服务端记账**
+   * 这一侧静默地什么都不落下。
+   */
+  business: QoderBusiness
   [key: string]: unknown
+}
+
+/**
+ * 请求体 `business` 的完整形状。
+ *
+ * 全部字段取自反编译的真实客户端（`qoder-worker-runtime.obf.mjs`）：
+ *
+ * | 字段 | 来源 |
+ * | --- | --- |
+ * | `product` | `rk()` → `product: rjA() ?? process.env[...] ?? "cli"`；桌面端常量是 `"app"` |
+ * | `type` | `rk()` → `type: process.env[...] ?? "agent"` |
+ * | `version` | `upn(A,...)` 的第一个参数，客户端传自己的版本号（如 `1.1.86-hotfix.16`） |
+ * | `id` / `begin_at` | `upn()` → `nXA()` / `Date.now()` |
+ * | `stage` | `upn()` 里初始化成 `"init"`，之后由 `changeBusinessState()` 推进 |
+ * | `model_key` | `O3()` → `{...upn(...), ...n ? {model_key: n} : {}}` |
+ * | `end_at` | 只在 `finalize()` 里写（生命周期结束时） |
+ *
+ * `stage` 的推进规则（客户端 `pye` 类）：`init → start → processing`，
+ * 结束由 `finalize` 写 `complete` / `abort` / `error`，并且**只在有 `id` 时**推进。
+ */
+export interface QoderBusiness {
+  id: string
+  name: string
+  begin_at: number
+  /** 产品线：`cli`（PAT/CLI 通道）或 `app`（桌面客户端通道）。 */
+  product?: string
+  /** 任务类型，客户端默认 `agent`。 */
+  type?: string
+  /** 发起请求的客户端版本号。 */
+  version?: string
+  /** 生命周期阶段。 */
+  stage?: QoderBusinessStage
+  /** 本任务用的模型 key。 */
+  model_key?: string
+  /** 生命周期结束时刻（`finalize` 才写）。 */
+  end_at?: number
+}
+
+/** `business.stage` 的取值域（客户端 `sR` 模块里的常量）。 */
+export type QoderBusinessStage = 'init' | 'start' | 'processing' | 'complete' | 'abort' | 'error'
+
+/**
+ * `business.product` 的取值。`cli` 是 CLI 产品线的默认值（`MKA = "cli"`），
+ * `app` 是桌面客户端的常量（`Od.businessProduct = "app"`）。
+ */
+export type QoderBusinessProduct = 'cli' | 'app'
+
+/**
+ * `session_type` 按区域取值的两个已知值。
+ *
+ * 客户端：`SPr = ti ? "qoderclicn" : "qodercli"`（`ti` 即国内版判定）。以前这里
+ * 写死成 `'qodercli'`，于是**国内版**请求带着国际版的会话类型出去。
+ */
+export type QoderSessionType = 'qodercli' | 'qoderclicn'
+
+/**
+ * 按区域取 `session_type`（客户端 `SPr = ti ? "qoderclicn" : "qodercli"`）。
+ *
+ * 国内外是**两套**会话类型，不是同一套换个名字：写死国际版的值，
+ * 国内版请求就带着一个不属于它的会话类型出去。
+ */
+export function sessionTypeOf(region: 'cn' | 'global'): QoderSessionType {
+  return region === 'cn' ? 'qoderclicn' : 'qodercli'
+}
+
+/**
+ * 给模板挂上 `business` 的**身份**字段（product / type / version / stage）。
+ *
+ * 拆成独立函数是因为它只负责「这台机器 / 这条产品线是谁」，而 `id` / `begin_at`
+ * 这类「这场会话是哪一场」由调用方的会话表管（见 `upstream.ts` 的 `sessionOf`）。
+ * 两者都是**整场会话内恒定**的：`id` 每轮换新会让服务端把一场会话记成 N 条
+ * 互不相干的记录，见 `QoderBusiness` 的说明。`stage` 由调用方按生命周期推进。
+ */
+export function applyBusinessIdentity(
+  body: QoderChatTemplate,
+  identity: {
+    product: QoderBusinessProduct
+    version: string
+    stage?: QoderBusinessStage
+    modelKey?: string
+  },
+): void {
+  body.business.product = identity.product
+  // `type` 客户端恒为该值（`rk()` 的 `type: ... ?? "agent"`），不是可变项。
+  body.business.type = 'agent'
+  body.business.version = identity.version
+  if (identity.stage !== undefined) body.business.stage = identity.stage
+  if (identity.modelKey !== undefined) body.business.model_key = identity.modelKey
 }
 
 /** 构建一份全新的聊天请求体（每个请求必须换 ID）。 */
@@ -79,6 +171,8 @@ export function createChatBodyTemplate(): QoderChatTemplate {
     source: 1,
     version: '3',
     aliyun_user_type: 'personal_standard',
+    // 真正的值由调用方按区域覆盖（见 sessionTypeOf）；这里保留国际版默认，
+    // 因为「没有区域信息」的老调用方此前拿到的就是它。
     session_type: 'qodercli',
     agent_id: 'agent_common',
     task_id: 'common',
@@ -101,10 +195,26 @@ export function createChatBodyTemplate(): QoderChatTemplate {
 // OpenAI 消息 → Qoder 消息
 // ---------------------------------------------------------------------------
 
+/** 消息内容的一个 part（文本 / 图片），可带 prompt-cache 标记。 */
+export interface QoderContentPart {
+  type?: string
+  text?: string
+  image_url?: { url?: string }
+  /** `cache_control: {type:'ephemeral'}`，见 {@link applyCacheControl}。 */
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' }
+}
+
 export interface QoderIncomingMessage {
   role: string
-  content?: string
-  contents?: Array<{ type?: string; text?: string; image_url?: { url?: string } }>
+  /**
+   * 纯文本内容；或 parts 数组。
+   *
+   * 两种形状上游都接受（客户端的 system 投影里 `1===t.length &&
+   * "string"==typeof t[0]` 就直出字符串）。只有 {@link applyCacheControl}
+   * 真要标记时才会把字符串转成数组。
+   */
+  content?: string | QoderContentPart[]
+  contents?: QoderContentPart[]
   tool_calls?: unknown[]
   name?: string
   tool_call_id?: string
@@ -346,6 +456,81 @@ export function extractLatestUserPrompt(messages: Array<Record<string, unknown>>
 export function deepClone<T>(value: T): T {
   return structuredClone(value)
 }
+
+/**
+ * 给「最后一条 system 消息的最后一个非空文本块」打 `cache_control: ephemeral`。
+ *
+ * ## 标记点为什么是 system 消息，而不是 magpie 说的「最后一个 user turn」
+ *
+ * magpie（`packages/qoder/index.mjs` 的 `cacheMarked`）标的是最后一个 user turn
+ * 的最后一个非 thinking/tool 块。真实客户端（app.asar.unpacked 里
+ * `qoder-worker-runtime.obf.mjs`）的 `BHc(A,e)` 恰好相反：
+ *
+ * ```js
+ * function BHc(A,e){
+ *   let t=A.findIndex(A=>"system"!==A.role), i=(t<0?A.length:t)-1, n=A[i];
+ *   if("system"!==n?.role) return;                        // 只标 system
+ *   let r=n.content.findLastIndex(A=>A.text.length>0);    // 最后一个非空文本块
+ *   return r<0?void 0:{index:i, message:{role:"system",
+ *     content:n.content.map((A,t)=>t===r?{...A,cacheControl:e}:A)}}
+ * }
+ * ```
+ *
+ * 即：从数组头起第一条非 system 的位置往前推一格，**只标那条 system 消息**，
+ * 标它内部最后一个非空文本块；其余消息一概不动。`IHc` 负责把已有的 tool 块
+ * 标记按当前开关值重写或剥掉（我们不发 tool 块级别的标记，故无需对应逻辑）。
+ *
+ * ## 为什么默认关闭（这是取舍，不是遗漏）
+ *
+ * 客户端里这个开关的值来自 `Pjc(A)`：只有**模型自己声明了**
+ * `capabilities.cacheControl`（或 anthropic-compatible 适配器 + `cache.mode ===
+ * "auto"`）才进 `promptCache` 表；而 `promptCache` 只有 `cde`（自定义 provider）
+ * 去读，调用点是 `ZPi`，`ZPi` 的唯一调用方是自定义 provider 的 `inference`。
+ *
+ * 换句话说：**Qoder 内建通道根本不吃这个字段**。它的缓存是服务端按
+ * `session_id` 分桶自动做的（issue #42 的实测：固定 session_id 后命中率
+ * 99.8%）。对一个没声明该能力的模型硬发 `cache_control`，是在递一个它没要的
+ * 字段 —— 轻则被忽略，重则被当成不认识的块类型拒掉。
+ *
+ * 所以这里做成显式开关：`undefined` 即原样返回，调用方按实测结论决定开不开。
+ * 想验证它有没有用，用 `QoderUpstreamOptions.cacheControl` 打开做 A/B。
+ *
+ * ## 形状：`content` 从字符串变成 parts 数组
+ *
+ * 客户端标记后 `content` 就是 parts 数组（`n.content.map(...)`），未标记时字节
+ * 串与数组都接受（它的 system 投影里 `1===t.length && "string"==typeof t[0]`
+ * 就直出字符串）。所以我们只在**真要标记**时才把 `content` 转成数组，与客户端
+ * 标记后的形状一致；不标记时一个字都不改。
+ */
+export function applyCacheControl(
+  messages: QoderIncomingMessage[],
+  cacheControl: { type: 'ephemeral'; ttl?: '1h' } | undefined,
+): QoderIncomingMessage[] {
+  if (cacheControl === undefined) return messages
+  const firstNonSystem = messages.findIndex(m => m.role !== 'system')
+  const at = (firstNonSystem < 0 ? messages.length : firstNonSystem) - 1
+  const target = messages[at]
+  if (target === undefined || target.role !== 'system') return messages
+
+  // 统一成 parts 再看：字符串 content 视为单个 text part。
+  const parts: QoderContentPart[] = Array.isArray(target.content)
+    ? target.content
+    : typeof target.content === 'string' && target.content.length > 0
+      ? [{ type: 'text', text: target.content }]
+      : []
+  let blockAt = -1
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    const text = parts[i]?.text
+    if (typeof text === 'string' && text.length > 0) { blockAt = i; break }
+  }
+  if (blockAt < 0) return messages
+
+  const marked = parts.map((part, i) => (i === blockAt ? { ...part, cache_control: cacheControl } : part))
+  const out = messages.slice()
+  out[at] = { ...target, content: marked }
+  return out
+}
+
 
 /** 模型名 → 是否需要图像输入（is_vl）。两个入口都改：model_config 与 chat_context.extra.modelConfig。 */
 export function applyModelKey(body: QoderChatTemplate, key: string, userType: string, isVl: boolean): void {

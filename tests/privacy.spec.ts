@@ -134,7 +134,19 @@ const RULES: Rule[] = [
     why: '真实邮箱地址；示例一律用 example.com',
     allow: match => /@(example|test|localhost)\b/i.test(match)
       || /^[a-z0-9._%+-]*x{3,}@/i.test(match)   // xxxx@… 这类明显占位
-      || /\.(invalid|test|example|localhost)$/i.test(match.split('@')[1] ?? ''),
+      || /\.(invalid|test|example|localhost)$/i.test(match.split('@')[1] ?? '')
+      // **署名邮箱**：维护者自己的公开联系地址，出现在 `LICENSE-MODIFICATIONS.md`
+      // 与 `package.json` 的 `author` 里。那不是泄露 —— MIT 要求保留版权声明、
+      // npm 要求 author 可联系，而 `docs/PRIVACY.md` 本就把「作者公开身份」
+      // 单列为例外（与 `dingminhua` / `@dmh2002/` 同理）。
+      //
+      // 豁免刻意收得很窄：只放行**这一个域名**，其余邮箱规则（真实账号昵称、
+      // 财务数值、设备标识……）对它照旧生效。它挡的是「顺手把别人的邮箱写进
+      // 夹具」，不是「不许出现自己的署名」。
+      //
+      // 注意 `split('@')[1]` 可能带尾部符号：`<i@html.moe>` 取到的是 `html.moe>`，
+      // 所以先剥掉非域名字符再比较（第一版没剥，豁免静默失效）。
+      || (match.split('@')[1] ?? '').replace(/[^A-Za-z0-9.-].*$/, '').toLowerCase() === 'html.moe',
   },
   {
     // 位数放宽到 12+：真实的指纹取前 16 位，但 32 位全写、截断成别的长度
@@ -211,9 +223,76 @@ const RULES: Rule[] = [
     why: '设备标识的取值（字段名可以出现，取值不行）',
     allow: match => /[:=]\s*"<|EXAMPLE|PLACEHOLDER|xxx+/i.test(match),
   },
-]
+  {
+    // **表格行里的设备标识取值。**
+    //
+    // 上面那条规则只认 `machineId: "…"` 这种**赋值**写法，于是
+    // `| cosy-machineid | <值> | 同一值 |` 这种表格单元格一律漏检 —— 而本仓库
+    // 最重要的文档（CHANGELOG 的实测对照表）恰恰是表格形态。2026-11-21 就在这里
+    // 真的漏过一次：一张「插件 vs CLI 请求头逐项对比」表把本机 `machineid` 的 UUID
+    // 与完整的 88 字符 `machinetoken` 一起写进了 CHANGELOG，而护栏全绿。
+    //
+    // **只判表格行**，不判散文。散文里提字段名是正常的（注释、schema、变更说明
+    // 都要提它）。按形状判更不行 —— UUID / 长 base64 的形状在这个仓库里到处都是
+    // （图标 data URI、pnpm integrity、测试夹具），试过一版，误报几十条，那种规则
+    // 活不过一次 CI。两种都试过，最后收到「表格行 + 本行里还有没有长标识串」这个
+    // 唯一既无漏检又无噪声的判据。
+    pattern: /^\s*\|[^\n]*\bmachin(?:e)?(?:id|token|type|code)\b[^\n]*$/im,
+    why: '表格里的设备标识取值（字段名可以出现，取值不行）',
+    allow: match =>
+      // 脱敏占位。
+      /<[^>]*>|EXAMPLE|PLACEHOLDER|已脱敏|xxx+/i.test(match)
+      // 该行里没有**既不是头名、也不是字段名**的 ≥16 位标识串 —— 那说明「取值」
+      // 那一格只是描述性词语（`本机 UUID` / `各有值` / `同一值`），不是真值。
+      //
+      // 判据要排除两类**合法的长串**，否则一行里正常的头名引用就会被当成取值：
+      //   1. 设备标识自己的字段名（`machineid` / `machinetoken` …，含 `machin`）；
+      //   2. 其它 `cosy-*` 头名（`cosy-business-product` 有 21 个字符，比很多
+      //      真实取值还长）—— 这条是 2026-11-21 加 `LICENSE-MODIFICATIONS.md`
+      //      时踩出来的：那张修复摘要表把 `cosy-business-product` 写了进去，
+      //      护栏直接判成「写出了设备标识取值」。
+      || !/[|`\s]\s*(?![A-Za-z0-9_-]*(?:machin|cosy-))[A-Za-z0-9_-]{16,}\b/i.test(match),
+  },]
 
 describe('仓库里没有真实账号数据', () => {
+  /**
+   * 设备标识规则的**自测**。
+   *
+   * 一条只会全绿的黑名单等于没有黑名单。2026-11-21 这次泄露之所以能进仓库，
+   * 就是因为当时那条规则只认 `machineId: "…"` 的赋值写法，而真实泄露发生在
+   * **表格单元格**里。这里把那次的两种真实形态钉成用例：必须命中；脱敏后的
+   * 同样位置必须放行。
+   *
+   * 值本身用拼接构造，绝不在文件里出现真值 —— 否则这条自测自己就成了泄露。
+   */
+  it('设备标识规则能抓住表格形态的真实取值，并放行脱敏形态', () => {
+    const rule = RULES.find(r => r.why.includes('表格里的设备标识取值'))
+    expect(rule, '设备标识的表格形态规则不见了').toBeDefined()
+
+    const uuidLike = `${'d557'}${'b9b6'}-f92b-47a6-b59b-63cab2c1353b`
+    const tokenLike = `${'P1gA'}${'svsyfMXf6_6dap9-AUIje5fYplCUbUkR6TBKdLmq'}`
+    const leaks = [
+      `| \`cosy-machineid\` | \`${uuidLike}\` | 同一值 |`,
+      `| \`cosy-machinetoken\` | \`${tokenLike}\` | 同一值 |`,
+    ]
+    for (const line of leaks) {
+      const match = line.match(rule!.pattern)
+      expect(match, `应当命中：${line}`).not.toBeNull()
+      expect(rule!.allow?.(match![0]) ?? false, `不该被放行：${line}`).toBe(false)
+    }
+
+    const masked = [
+      '| `cosy-machineid` | 本机 UUID | 同一值 |',
+      '| `cosy-machinetoken` | `<88 字符，设备身份，已脱敏>` | 同一值 |',
+      '| `cosy-machinetype` | 各有值 | 全部同一值 |',
+    ]
+    for (const line of masked) {
+      const match = line.match(rule!.pattern)
+      if (match === null) continue
+      expect(rule!.allow?.(match[0]) ?? true, `不该命中：${line}`).toBe(true)
+    }
+  })
+
   const files = scannedFiles()
 
   /**
@@ -240,6 +319,9 @@ describe('仓库里没有真实账号数据', () => {
       '私钥',
       '手机号',
       '设备标识的取值',
+      // 2026-11-21 新增：表格形态。真实泄露就发生在表格单元格里，而上面那条
+      // 只认赋值写法 —— 两条必须同时存在，缺哪条都会留下一种漏检形态。
+      '表格里的设备标识取值',
     ]
     const actual = RULES.map(rule => rule.why)
     for (const expected of EXPECTED) {

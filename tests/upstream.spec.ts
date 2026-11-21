@@ -1334,24 +1334,35 @@ describe('projectCampaignEntry', () => {
 })
 
 /**
- * **cosy 面（chat + models）的协议版本**（issue #21）。
+ * **cosy 面（chat + models）的协议版本**（issue #21 + 2026-11-21 抓包纠正）。
  *
- * 上游按 `cosy-clienttype` / `cosy-version` 决定下发哪一套模型目录。旧值
- * `5` / `0.1.43` 让国际版静默少 3 个模型（`smodel` / `cmodel` / `fast`）、
- * 国内版少 `fast` —— 目录照常返回、对话照常能跑，没有任何报错指向那里，所以
- * 只能靠测试钉住，不能靠「跑起来看着没问题」。
+ * 上游按 `cosy-clienttype` / `cosy-version` 决定下发哪一套模型目录。
  *
- * 实测矩阵（2026-10-29，两个区域各一枚真实 PAT，只读目录）：
+ * ## 两个值各自的来历（别把它们的历史混在一起）
  *
- * | 区域   | `5` / `0.1.43` | `10` / `1.1.69`                  |
- * | ------ | -------------- | -------------------------------- |
- * | cn     | 9 条           | 10 条（+`fast`）                 |
- * | global | 11 条          | 14 条（+`smodel`/`cmodel`/`fast`）|
+ * `cosy-version` 的问题是**太旧**。最初写的是 `0.1.43`，那时上游还没有
+ * Sonus/Cantus/Fast；上游后来只把新模型发给新协议，旧版本号拿到的是**静默的
+ * 旧目录**——目录照常返回、对话照常能跑，只是少几个模型，没有任何报错指向那里。
  *
- * 两个值**成对**生效：国内版只提 clienttype、version 留旧值时目录不变，且
- * chat 报 `HTTP 403 code 112`。所以这里同时断言两者，不许只改一个。
+ * `cosy-clienttype` 的问题是**抄错了通道**。2026-10-29 的只读探测发现
+ * `10` / `1.1.69` 能多拿到模型，于是把两个值一起提到了 `10` / `1.1.69`。
+ * 但 `10` 是**桌面 App 通道**的值：2026-11-21 对官方 CN CLI（qoderclicn 1.1.94）
+ * 抓了 105 个请求，`cosy-clienttype` **全部是 `5`**，一次 `10` 都没有，而它的
+ * 目录里 13 个模型一个不少。
+ *
+ * 所以正确的组合是 **`5` + 真实 CLI 版本**：`10` 当初解决的问题（目录缩水）
+ * 真解是把**版本号**提上去，不是把 `clienttype` 换成桌面通道。
+ *
+ * ## 为什么不再断言一个写死的版本号
+ *
+ * 版本号现在由 `client-version.ts` 动态解析（releases 接口 → 只升不降 → 内置
+ * 兜底）。断言一个具体数字等于把「跟上游真实版本」这件事又钉死回去。这里断言
+ * 的是**关系**：三个请求头同值、形状合法、不低于内置兜底值。
  */
 describe('cosy 面协议版本（issue #21）', () => {
+  /** 内置兜底版本；注入它可以让断言与网络无关。 */
+  const PINNED = '1.1.94'
+
   /** 捕获每个请求实际发出的头，并应答 jobToken / models / chat。 */
   function capture(): { calls: Array<{ url: string, headers: Record<string, string> }>, client: QoderUpstreamClient } {
     const calls: Array<{ url: string, headers: Record<string, string> }> = []
@@ -1378,16 +1389,17 @@ describe('cosy 面协议版本（issue #21）', () => {
       // chat：一个空 SSE 帧就够——这条用例只关心请求头。
       return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } })
     }) as unknown as typeof fetch
-    return { calls, client: new QoderUpstreamClient('cn', { fetch: fetchImpl }) }
+    return { calls, client: new QoderUpstreamClient('cn', { fetch: fetchImpl, clientVersion: PINNED }) }
   }
 
-  it('模型目录请求带 clienttype 10 + version 1.1.69', async () => {
+  it('模型目录请求带 clienttype 5 + 真实 CLI 版本', async () => {
     const { calls, client } = capture()
     await client.fetchModels('pt-x')
     const models = calls.find(c => c.url.includes('/model/list'))
     expect(models).toBeDefined()
-    expect(models!.headers['cosy-clienttype']).toBe('10')
-    expect(models!.headers['cosy-version']).toBe('1.1.69')
+    // 抓包事实：官方 CN CLI 105/105 个请求都是 `5`。`10` 是桌面 App 通道。
+    expect(models!.headers['cosy-clienttype']).toBe('5')
+    expect(models!.headers['cosy-version']).toBe(PINNED)
   })
 
   it('对话请求带同一对协议版本（两条路径不许各说一套）', async () => {
@@ -1395,8 +1407,10 @@ describe('cosy 面协议版本（issue #21）', () => {
     await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
     const chat = calls.find(c => c.url.includes('agent_chat_generation'))
     expect(chat).toBeDefined()
-    expect(chat!.headers['cosy-clienttype']).toBe('10')
-    expect(chat!.headers['cosy-version']).toBe('1.1.69')
+    expect(chat!.headers['cosy-clienttype']).toBe('5')
+    expect(chat!.headers['cosy-version']).toBe(PINNED)
+    // `business.product` 与请求头必须是同一条产品线，否则服务端看到两个答案。
+    expect(chat!.headers['cosy-business-product']).toBe('cli')
   })
 
   it('jobToken 交换也带同一对版本（否则 chat 拿到的是半改的会话）', async () => {
@@ -1404,8 +1418,32 @@ describe('cosy 面协议版本（issue #21）', () => {
     await client.exchangeJobToken('pt-x')
     const exchange = calls.find(c => c.url.includes('jobToken'))
     expect(exchange).toBeDefined()
-    expect(exchange!.headers['cosy-clienttype']).toBe('10')
-    expect(exchange!.headers['cosy-version']).toBe('1.1.69')
+    expect(exchange!.headers['cosy-clienttype']).toBe('5')
+    expect(exchange!.headers['cosy-version']).toBe(PINNED)
+  })
+
+  it('不注入时用内置兜底版本，形状是真实 CLI 版本号而不是插件版本', async () => {
+    const calls: Array<{ url: string, headers: Record<string, string> }> = []
+    const client = new QoderUpstreamClient('cn', {
+      fetch: (async (url: string | URL, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          headers: Object.fromEntries(new Headers(init?.headers ?? {}).entries()),
+        })
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }) as unknown as typeof fetch,
+    })
+    await client.exchangeJobToken('pt-x')
+    // 注意别用 `at(-1)`：交换 jobToken 之后还会顺带换一枚 sash 令牌，
+    // 那条请求不带 cosy-version。
+    const exchange = calls.find(c => c.url.includes('/user/jobToken'))
+    expect(exchange).toBeDefined()
+    const version = exchange!.headers['cosy-version']!
+    // 1.1.x 形状：这是 Qoder CLI 的版本线，不是插件的 1.27.x。
+    expect(version).toMatch(/^1\.1\.\d+$/)
   })
 
   it('sash 面不受影响：不带 cosy-version，clienttype 仍是 sash 自己的 10', async () => {
@@ -1719,12 +1757,49 @@ describe('chatStream 的 session_id 稳定性（issue #42）', () => {
     expect(bodies).toHaveLength(2)
     expect(bodies[0]!.session_id).toBe(sessionId)
     expect(bodies[1]!.session_id).toBe(sessionId)
-    // 单次请求标识仍每轮换新 —— 它们换新是正确的，只有 session_id 不该换。
+    // 单次请求标识仍每轮换新 —— 它们换新是正确的。
     expect(bodies[0]!.request_id).not.toBe(bodies[1]!.request_id)
     expect(bodies[0]!.request_set_id).not.toBe(bodies[1]!.request_set_id)
+    // ⚠️ `business.id` 的粒度是**一条用户输入**，不是会话、也不是单次请求。
+    //
+    // 这条断言被改过两次，两个方向都错过：
+    //   1. 最初断言 `not.toBe`（每轮换新）—— 把「一条用户输入一条记录」错写成
+    //      「一次补全一条记录」，一轮里的工具循环会散成 N 条。
+    //   2. 随后改成 `toBe`（整场会话固定）—— 同一场会话的第 2 轮并进第 1 轮，
+    //      服务端只看到一条永远不闭合的记录。
+    //
+    // 现在的实现按「会话 + 本轮用户提示」归组，并在这两轮之间**闭合**过第一轮
+    // （`finishTurn` 会把记录从表里删掉），所以两轮拿到的是两个不同的 id。
+    // 判据来自客户端源码：`Mh.create` 把 `userMessage.requestSetId` 传给
+    // `Fz(..., id: o || randomUUID())`，而 `requestSetId` 是**每条用户消息**一个。
     expect((bodies[0]!.business as Record<string, unknown>).id).not.toBe(
       (bodies[1]!.business as Record<string, unknown>).id,
     )
+  })
+
+  it('同一轮的多次补全共用同一个 business.id（工具循环不散成 N 条）', async () => {
+    const { bodies, client } = capture()
+    const sessionId = 'session-tool-loop-1'
+    const messages = [{ role: 'user', content: '跑个工具' }]
+    // 一轮工具循环 = 同一条用户提示下连续多次补全，期间**不闭合**。
+    for (let i = 0; i < 3; i += 1) {
+      await client.chatStream('pt-x', 'qfmodel', messages, { sessionId, onDelta: () => {} })
+    }
+    expect(bodies).toHaveLength(3)
+    expect((bodies[0]!.business as Record<string, unknown>).id).toBe(
+      (bodies[1]!.business as Record<string, unknown>).id,
+    )
+    expect((bodies[1]!.business as Record<string, unknown>).id).toBe(
+      (bodies[2]!.business as Record<string, unknown>).id,
+    )
+    // `begin_at` 也必须钉住，否则同一轮被记成三个时间窗。
+    expect((bodies[0]!.business as Record<string, unknown>).begin_at).toBe(
+      (bodies[2]!.business as Record<string, unknown>).begin_at,
+    )
+    // 阶段推进照客户端 `changeBusinessState()`：首包 `start`，之后 `processing`。
+    expect((bodies[0]!.business as Record<string, unknown>).stage).toBe('start')
+    expect((bodies[1]!.business as Record<string, unknown>).stage).toBe('processing')
+    expect((bodies[2]!.business as Record<string, unknown>).stage).toBe('processing')
   })
 
   it('sessionId 缺席时退回随机，不写空串（老调用方不受影响）', async () => {
@@ -1733,5 +1808,220 @@ describe('chatStream 的 session_id 稳定性（issue #42）', () => {
     expect(bodies).toHaveLength(1)
     expect(typeof bodies[0]!.session_id).toBe('string')
     expect((bodies[0]!.session_id as string).length).toBeGreaterThan(0)
+  })
+})
+
+// ==========================================================================
+// 节点发现（cherry-pick 自 pi-provider-qoder，字段名以真实客户端为准）
+//
+// 这里钉三件事：发现成功时聊天确实打到 inference 节点、URL 拼接不出现双斜杠、
+// 发现失败时静默退回默认网关（**聊天不能因此被挡住**）。
+// ==========================================================================
+describe('节点发现与 inference 节点轮换', () => {
+  /**
+   * 造一个假上游：节点表、jobToken、chat 三条路径分开记。
+   *
+   * `nodes` 为 `undefined` 时让节点表返回 500 —— 用它验证「发现失败不影响聊天」。
+   */
+  function upstream(options: { nodes?: unknown, status?: number } = {}) {
+    const chatUrls: string[] = []
+    let endpointCalls = 0
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/service/region/endpoints')) {
+        endpointCalls += 1
+        if (options.nodes === undefined) {
+          return new Response('boom', { status: options.status ?? 500 })
+        }
+        return new Response(JSON.stringify(options.nodes), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (u.includes('jobToken') && !u.includes('exchange')) {
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (u.includes('jobToken/exchange')) {
+        return new Response(JSON.stringify({ token: 'jt-TEST' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (u.includes('/algo/api/v2/model/list')) {
+        return new Response(JSON.stringify({ chat: [{ key: 'qfmodel', display_name: 'Q' }] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatUrls.push(u)
+      return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as unknown as typeof fetch
+    return {
+      chatUrls,
+      endpointCalls: () => endpointCalls,
+      client: new QoderUpstreamClient('cn', { fetch: fetchImpl }),
+    }
+  }
+
+  it('发现到 inferNodes 后，聊天打到该节点而不是默认网关', async () => {
+    const { chatUrls, client } = upstream({ nodes: { inferNodes: ['infer.example.com'] } })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
+    expect(chatUrls).toHaveLength(1)
+    expect(chatUrls[0]!.startsWith('https://infer.example.com/algo/api/v2/')).toBe(true)
+    // 拼接不能出现双斜杠：节点表里的 URL 带尾斜杠、chatPath 以 `/` 开头。
+    expect(chatUrls[0]).not.toContain('//algo')
+  })
+
+  it('节点表在 TTL 内不重复拉取（同一实例复用缓存）', async () => {
+    const { client, endpointCalls } = upstream({ nodes: { inferNodes: ['infer.example.com'] } })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'a' }], { onDelta: () => {} })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'b' }], { onDelta: () => {} })
+    expect(endpointCalls()).toBe(1)
+  })
+
+  it('发现失败时静默退回默认网关，聊天照常发出', async () => {
+    const { chatUrls, client } = upstream({ nodes: undefined })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
+    expect(chatUrls).toHaveLength(1)
+    expect(chatUrls[0]!.startsWith('https://gateway.qoder.com.cn/')).toBe(true)
+  })
+
+  it('节点表为空时也退回默认网关（不计为错误）', async () => {
+    const { chatUrls, client } = upstream({ nodes: { centerNodes: [], inferNodes: [] } })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
+    expect(chatUrls[0]!.startsWith('https://gateway.qoder.com.cn/')).toBe(true)
+  })
+
+  it('连续两轮走同一个 inference 节点（换节点会丢 KV cache）', async () => {
+    const { chatUrls, client } = upstream({
+      nodes: { inferNodes: ['a.example.com', 'b.example.com'] },
+    })
+    for (let i = 0; i < 2; i += 1) {
+      await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: `t${i}` }], { onDelta: () => {} })
+    }
+    expect(chatUrls).toHaveLength(2)
+    expect(new URL(chatUrls[0]!).host).toBe(new URL(chatUrls[1]!).host)
+  })
+
+  /**
+   * **引入发现之后最容易造成的回归**：选举出来的节点在本机不可达。
+   *
+   * 在发现功能之前，chat 永远打 `region.gateway`，而它是「用户网络一定能通」的
+   * 那一个（用户就是这么配上 PAT 的）。选举来的节点没有这个保证 —— 国内访问
+   * 国际版、或企业网络只放行网关域名时，连接会直接抛在网络层。如果不兜回去，
+   * 一个纯优化功能就把「一直能用」变成「全挂」。
+   */
+  it('选举出的节点网络不可达时，退回默认网关重试一次', async () => {
+    const chatUrls: string[] = []
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/service/region/endpoints')) {
+        return new Response(JSON.stringify({ inferNodes: ['unreachable.example.com'] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (u.includes('jobToken') && !u.includes('exchange')) {
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (u.includes('jobToken/exchange')) {
+        return new Response(JSON.stringify({ token: 'jt-TEST' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatUrls.push(u)
+      if (u.includes('unreachable.example.com')) {
+        // 网络层失败：fetch 直接抛，没有 HTTP 状态码。
+        throw new TypeError('fetch failed')
+      }
+      return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as unknown as typeof fetch
+
+    const client = new QoderUpstreamClient('cn', { fetch: fetchImpl })
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
+
+    expect(chatUrls).toHaveLength(2)
+    expect(chatUrls[0]).toContain('unreachable.example.com')
+    expect(chatUrls[1]!.startsWith('https://gateway.qoder.com.cn/')).toBe(true)
+  })
+
+  /**
+   * HTTP 错误**不**换节点重发。
+   *
+   * 4xx/5xx 是节点自己给出的答复，说明连通性没问题 —— 那属于业务失败（配额、
+   * 凭据、限流）。换节点重发只会把同一个错误再问一遍，还可能把一次配额错误
+   * 放大成两次计费。
+   */
+  it('选举节点返回 429 时直接失败，不拿同一份请求再打一次网关', async () => {
+    const chatUrls: string[] = []
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/service/region/endpoints')) {
+        return new Response(JSON.stringify({ inferNodes: ['busy.example.com'] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (u.includes('jobToken') && !u.includes('exchange')) {
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (u.includes('jobToken/exchange')) {
+        return new Response(JSON.stringify({ token: 'jt-TEST' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatUrls.push(u)
+      return new Response('{"code":"10605","message":"limited"}', {
+        status: 429, headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    const client = new QoderUpstreamClient('cn', { fetch: fetchImpl })
+    await expect(
+      client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} }),
+    ).rejects.toThrow()
+    expect(chatUrls).toHaveLength(1)
+  })
+
+  /** 用户取消也要原样抛出：不能把一场已结束的对话再发一次（可能再计一次费）。 */
+  it('用户取消时原样抛出，不退回网关重发', async () => {
+    const chatUrls: string[] = []
+    const controller = new AbortController()
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/service/region/endpoints')) {
+        return new Response(JSON.stringify({ inferNodes: ['infer.example.com'] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (u.includes('jobToken') && !u.includes('exchange')) {
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (u.includes('jobToken/exchange')) {
+        return new Response(JSON.stringify({ token: 'jt-TEST' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatUrls.push(u)
+      const abort = new Error('aborted')
+      abort.name = 'AbortError'
+      throw abort
+    }) as unknown as typeof fetch
+
+    const client = new QoderUpstreamClient('cn', { fetch: fetchImpl })
+    await expect(
+      client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], {
+        onDelta: () => {},
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow()
+    expect(chatUrls).toHaveLength(1)
   })
 })

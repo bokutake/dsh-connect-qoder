@@ -151,6 +151,14 @@ export interface QoderShimOptions {
   /** 该模型是否支持图像输入（用于请求校验，可选）。 */
   supportsImagesOf?: (displayName: string) => boolean
   /**
+   * 该模型的输出上限（token），来自上游 `/model/list` 的 `max_output_tokens`。
+   *
+   * 官方客户端每个请求都带 `parameters.max_tokens`，上游据此分配输出预算；
+   * 不再发这个字段时，用户在设置里选的上限对上游不可见（见 `chatStream` 的
+   * `maxOutputTokens`）。
+   */
+  maxOutputTokensOf?: (displayName: string) => number | undefined
+  /**
    * 该模型在设置里保存的思考强度档位（模型显示名 → 档位名）。
    *
    * 「设置里选一次、之后每个请求自动带上」——与 Qoder 客户端同形态
@@ -573,6 +581,9 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
 
     const key = options.modelKeyOf ? options.modelKeyOf(model) ?? model : model
     const supportsImages = options.supportsImagesOf ? options.supportsImagesOf(model) : false
+    // 该模型的输出上限（上游 `max_output_tokens`）。缺席时交给 chatStream 用
+    // 客户端同值的兜底，所以这里只需要原样透传 undefined。
+    const maxOutputTokens = options.maxOutputTokensOf ? options.maxOutputTokensOf(model) : undefined
     // 设置里为该模型保存的思考强度。选中档位本身就是「开启思考并指定强度」，
     // 所以它与布尔 is_reasoning 是同一件事的两个粒度——档位存在时按开启处理。
     const savedEffort = options.reasoningEffortOf ? options.reasoningEffortOf(model) : undefined
@@ -697,6 +708,7 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
           ...(tools === undefined ? {} : { tools }),
           isReasoning,
           ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
           ...(sessionId === undefined ? {} : { sessionId }),
           isVl: supportsImages,
           signal: controller.signal,
@@ -757,6 +769,28 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
         res.write(`data: ${JSON.stringify(done)}\n\n`)
         res.write('data: [DONE]\n\n')
         res.end()
+        // 轮次在这里结束：`finish_reason` 不是 `tool_calls` 就说明宿主不会再用
+        // 这次结果续下一段补全，用户提示到此为止。
+        //
+        // 闭合是**尽力而为**：`finishTurn` 内部永不抛，失败只记日志。放在
+        // `res.end()` 之后是有意的 —— 闭合是记账动作，不该让用户多等一个往返。
+        //
+        // 必须用 `setImmediate` 而不是直接 `void finishCurrentTurn()`：直接调用
+        // 会在**当前微任务队列里**开始跑，而那个队列跑完之前 `res.end()` 的收尾
+        // 还没落地。测试里表现为 "write after end"（`ERR_STREAM_WRITE_AFTER_END`）
+        // —— 上一次请求的闭合请求打到已经被复用的桩上。排到下一轮事件循环既能
+        // 让本请求先干净收尾，也不改变「用户不等它」这个性质。
+        if (!hasToolCalls) {
+          // 先把凭据取成局部常量：闭包里的 `serving` 可能是 undefined（类型上
+          // 它是可选值），而进入这里的路径一定已经解析出过一次可用的 serving。
+          const pat = serving.pat
+          setImmediate(() => {
+            // 用可选调用而不是裸调用：`QoderShimOptions.upstream` 的契约只要求
+            // 那个 `chatStream`，测试与外部集成方递进来的经常是鸭子类型的替身。
+            // 缺这个方法只意味着「不闭合」，不该变成一条未捕获异常。
+            void upstream.finishCurrentTurn?.(pat, 'end_turn')
+          })
+        }
         return
       } catch (error) {
         if (wroteAny) {

@@ -229,10 +229,18 @@ function identityPayload(identity: CosyAuthIdentity): Record<string, string> {
 /**
  * Bearer 载荷：{cosyVersion, ideVersion, info, requestId, version} 的
  * 标准 base64（键序按字典序，与 qoder2api 一致）。
+ *
+ * `cosyVersion` 必须与 `cosy-version` **请求头**同值。实测抓包（qoderclicn
+ * 1.1.94）解出的载荷是 `{version:"v1", requestId, info, cosyVersion:"1.1.94",
+ * ideVersion:""}` —— 头上发什么版本，载荷里就是什么版本。
+ *
+ * 此前这里用独立的 `COSY_VERSION`（`0.1.43`），与头部的 `1.1.69` 并不一致，
+ * 相当于同一个请求里声明了两个不同的客户端版本。它能跑通，但那是自相矛盾的
+ * 身份；统一之后两者同源。
  */
-export function buildPayloadB64(info: string): string {
+export function buildPayloadB64(info: string, cosyVersion: string = COSY_VERSION): string {
   const payload = {
-    cosyVersion: COSY_VERSION,
+    cosyVersion,
     ideVersion: '',
     info,
     requestId: randomUUID(),

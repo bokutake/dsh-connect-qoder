@@ -2107,6 +2107,14 @@ describe('图片默认种子（issue #22）', () => {
           status: 200, headers: { 'content-type': 'application/json' },
         })
       }
+      if (url.includes('/api/v3/service/region/endpoints')) {
+        // 节点发现：这个桩不模拟节点表，明确回空表，让客户端退回默认网关。
+        // 不写这一条的话它会落到 `realFetch` —— 真的打外网、拿到 404，然后
+        // 顺带把「发现失败」这条调试日志灌进测试输出。
+        return new Response(JSON.stringify({ centerNodes: [], inferNodes: [] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
       if (url.includes('/jobToken')) {
         return new Response(JSON.stringify({
           id: 'u1', name: 'Tester', expireTime: Date.now() + 86_400_000,

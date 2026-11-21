@@ -28,6 +28,7 @@ import type { AdapterRegistrationHandle, DirectoryRegistrationHandle } from '@de
 import { QoderUpstreamClient } from './upstream.ts'
 import { failoverNoticeText, queuedFailoverNoticeText, upstreamDownFailoverNoticeText } from './failover-notice.ts'
 import type { QoderUsage, QoderChatDelta, QoderRegion, QoderUpstreamError, UpstreamErrorKind, QoderCampaignFeed } from './upstream.ts'
+import type { QoderIdentityOverride } from './device-identity.ts'
 import { isQoderUpstreamError } from './upstream.ts'
 import type { QoderModelInfo } from './catalog.ts'
 import { QoderCatalog, fallbackModelInfo, deriveCatalog, initialEnabledKeys, parseUpstreamModel, applyContextBudgets, modelDisplayName, withoutRouters, withoutAbstractModels, withoutForeignRegionModels, mapContextTier, mapContextTiers, migrateContextBudgets } from './catalog.ts'
@@ -411,6 +412,19 @@ export interface Config {
    * 「不替用户动侧边栏」。缺席读作关闭（`=== true` 判据见 `status-paths.ts`）。
    */
   sidebarPanel?: boolean
+  /**
+   * 设备身份来源（见 `Config` 里同名项的注释）。缺席读作 `real`。
+   */
+  deviceIdentity?: 'real' | 'derived' | 'manual'
+  /**
+   * 人工设备身份（只在 `deviceIdentity: 'manual'` 时生效）。
+   */
+  identityOverride?: {
+    machineId?: string
+    machineToken?: string
+    machineType?: string
+    machineCode?: string
+  }
 }
 
 export const Config: z<Config> = z.object({
@@ -442,6 +456,43 @@ export const Config: z<Config> = z.object({
       .default(false)
       .description('Add a Qoder panel to the DSH sidebar: a nav row that opens the credits / accounts / model catalog as a full page. Off by default — the row claims a global sidebar seat shared by every bundle, and the Plugins page already reaches the same content.'),
   ) as unknown as z<boolean>,
+  /**
+   * 向 Qoder 声明的**设备身份**从哪来。默认 `real`。**顶层而不是区域级** ——
+   * 它是整机属性，与哪个区域无关；按区域各配一份只会让同一台机器对两只上游
+   * 声称两种身份。
+   *
+   * 三档的取舍见 `src/device-identity.ts` 的模块注释，一句话版本：
+   *
+   *   - `real` —— 本机 `machine_id` 文件 + 桌面客户端的 UMID 组件（取不到则逐
+   *     字段退回派生值）。**这是与官方客户端一致的唯一一档**，也是默认值。
+   *   - `derived` —— 全部由凭据摘要派生。1.27.x 及以前的行为，留给「换回旧行为
+   *     对比一下」的场合。它的 `machineId` 与 `machineToken` 是同一个值，而真实
+   *     客户端里这两个**从来不是**同一个值。
+   *   - `manual` —— 用 {@link identityOverride} 里填的值。默认不给 UI 入口。
+   *
+   * 为什么要暴露出来而不是写死：本机身份读取器在某个平台失效时，用户需要一条
+   * 「不改代码就能换个身份再试」的路，否则只能去改 `node_modules` 里的构建产物
+   * （升级即静默还原）。
+   */
+  deviceIdentity: z.union([
+    z.const('real'), z.const('derived'), z.const('manual'),
+  ]).default('real').description('Where the declared device identity comes from: "real" = this machine\'s machine_id file plus the desktop client\'s UMID component (the default, and the only setting that matches the official client); "derived" = hash the credential (the pre-1.28 behavior); "manual" = use identityOverride.'),
+  /**
+   * 人工填写的设备身份（只在 `deviceIdentity: 'manual'` 时生效）。
+   *
+   * **默认全空，且不提供 UI 入口。** 填别人的真实指纹等于伪造设备身份；填一个
+   * 不存在的值比填旧值更容易被风控筛出来。它唯一的正当用途是：本机读取器在
+   * 某平台上失效时，让人工值顶上做对照实验。
+   *
+   * 缺席的字段各自退回默认来源，所以只填 `machineId` 也能工作。
+   */
+  identityOverride: z.object({
+    machineId: z.string().default(''),
+    machineToken: z.string().default(''),
+    machineType: z.string().default(''),
+    machineCode: z.string().default(''),
+  }).default({ machineId: '', machineToken: '', machineType: '', machineCode: '' })
+    .description('Manual device identity, used only when deviceIdentity is "manual". Empty fields fall back to the default source. No UI entry point on purpose.'),
 }) as unknown as z<Config>
 
 /**
@@ -494,6 +545,50 @@ export function regionStateOf(config: { regions?: Record<string, unknown> | null
   const stored = regions?.[region]
   if (stored !== undefined && stored !== null && typeof stored === 'object') return stored as Record<string, unknown>
   return {}
+}
+
+/**
+ * 设备身份来源模式。认不出的值一律读作 `real`。
+ *
+ * 为什么不 `throw`：这个值来自用户可编辑的配置文件，写错一个字母不该让整个
+ * 插件起不来。退回默认值（`real`）也不会比现状更差 —— 它本来就是默认值。
+ */
+export function deviceIdentityModeOf(config: { deviceIdentity?: unknown }): 'real' | 'derived' | 'manual' {
+  const raw = config.deviceIdentity
+  return raw === 'derived' || raw === 'manual' ? raw : 'real'
+}
+
+/**
+ * 人工身份覆盖值：把空字符串过滤掉，全空时整个字段都不传。
+ *
+ * `exactOptionalPropertyTypes` 下「传一个全空的 override 对象」与「不传」是两件事，
+ * 后者才对 —— 所以空值必须在这里被吃掉，不能指望下游判断。
+ */
+export function identityOverrideOf(
+  config: { identityOverride?: unknown },
+): { identityOverride?: QoderIdentityOverride } {
+  const raw = config.identityOverride
+  if (raw === null || typeof raw !== 'object') return {}
+  const record = raw as Record<string, unknown>
+  const pick = (key: string): string | undefined => {
+    const value = record[key]
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+  }
+  const machineId = pick('machineId')
+  const machineToken = pick('machineToken')
+  const machineType = pick('machineType')
+  const machineCode = pick('machineCode')
+  if (machineId === undefined && machineToken === undefined && machineType === undefined && machineCode === undefined) {
+    return {}
+  }
+  return {
+    identityOverride: {
+      ...machineId === undefined ? {} : { machineId },
+      ...machineToken === undefined ? {} : { machineToken },
+      ...machineType === undefined ? {} : { machineType },
+      ...machineCode === undefined ? {} : { machineCode },
+    },
+  }
 }
 
 /** 某区域是否启用（opt-out）。 */
@@ -1178,7 +1273,11 @@ function displayModels(region: QoderRegion): readonly QoderModelInfo[] {
 
   // 每个区域：上游客户端 + 回环 shim + vault store + 池运行期。
   for (const region of QODER_REGIONS) {
-    const upstream = new QoderUpstreamClient(region, { logger: log })
+    const upstream = new QoderUpstreamClient(region, {
+      logger: log,
+      deviceIdentity: deviceIdentityModeOf(config),
+      ...identityOverrideOf(config),
+    })
     const catalog = new QoderCatalog(QODER_FALLBACK_MODELS.map(fallbackModelInfo))
     const store = new QoderAccountStore(region)
     let poolRuntime: Record<string, QoderPoolProbe> = {}
@@ -1206,6 +1305,9 @@ function displayModels(region: QoderRegion): readonly QoderModelInfo[] {
       credential: () => resolveServingPat(region),
       modelKeyOf: selector => catalog.keyOf(selector),
       supportsImagesOf: selector => catalog.supportsImagesOf(selector),
+      // 上游给这个模型的输出上限（`/model/list` 的 `max_output_tokens`）。官方
+      // 客户端每个请求都带 `parameters.max_tokens`，上限就来自同一处。
+      maxOutputTokensOf: selector => catalog.maxOutputTokensOf(selector),
       // 设置里为这个模型保存的思考强度（模型选择器名 → 档位名）。目录换代后
       // 旧 key 自然失配（返回 undefined），请求退回模型默认档，不需要额外清理。
       reasoningEffortOf: selector => {
