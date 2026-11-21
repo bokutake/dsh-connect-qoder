@@ -2650,9 +2650,41 @@ describe('issue #33：池的「测试」不吃被勾选裁剪过的目录（真�
     } as never)
     await mountQoder(ctx, { regions })
     await waitFor(() => routes.some(r => r.path.includes('/pool')))
+    const usage = routes.find(r => r.path.includes('/usage'))!
+    // **等目录真的从上游装进来**（与上面「图片默认种子」同一个竞态，见那处的
+    // 长注释）。启动时的 `refreshModels` 是 fire-and-forget，路由在它之前就注册
+    // 好了；这个 describe 的用例全都依赖「目录里有哪些模型」：
+    //
+    //   - 「解析不出目标时回 409」这条，桩里只有付费的 `dfmodel` —— 目录没到位
+    //     时目录里连 `dfmodel` 都没有，「有付费模型但无免费模型」这个前提不成立，
+    //     于是走到别的分支回 200，断言 409 失败；
+    //   - 「手选的目标模型不在 enabledModelKeys 里」同理，要先有目录才谈得上
+    //     「目标 stale」。
+    //
+    // 判据用「目录里出现了 `dfmodel`」：它是这个 describe 所有桩里唯一的共同模型
+    // （`stubUpstream` 的目录含 `qfmodel` + `dfmodel`，409 那条的桩只有 `dfmodel`），
+    // 而兜底表里也有 `dfmodel` —— 所以不能只判存在，还要判**长度与桩一致**
+    // 不可行（两个桩长度不同）。这里退一步：等 `dfmodel` 出现，且本地目录已不再
+    // 是兜底的 9 条。兜底表经 `cn` 过滤是 9 条，而这两个桩一个是 2 条、一个是
+    // 1 条，所以「长度 != 9」就足够区分。
+    const startedAt = Date.now()
+    const readDoc = async (): Promise<{ models?: Array<{ key: string }> }> => {
+      const probe = fakeResponse()
+      await usage.handler({ method: 'GET', url: `${usage.path}?region=cn`, headers: {} }, probe.node)
+      return JSON.parse(String(probe.body() ?? '{}')) as { models?: Array<{ key: string }> }
+    }
+    for (;;) {
+      const keys = ((await readDoc()).models ?? []).map(m => m.key)
+      // 桩最多给 2 条；兜底是 9 条。出现 `dfmodel` 且总数不是 9 ⇒ 已换成上游目录。
+      if (keys.includes('dfmodel') && keys.length !== 9) break
+      if (Date.now() - startedAt > 10_000) {
+        throw new Error(`目录一直没换成上游目录，当前 key：${keys.join(',') || '(空)'}`)
+      }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
     return {
       pool: routes.find(r => r.path.includes('/pool'))!,
-      usage: routes.find(r => r.path.includes('/usage'))!,
+      usage,
     }
   }
 
