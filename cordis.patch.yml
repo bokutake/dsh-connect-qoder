@@ -9,4 +9,4 @@
 # node_modules — carries the npm scope.
 - insert:
     - id: dsh-connect-qoder
-      name: '@dmh2002/dsh-connect-qoder'
+      name: '@bokutake/dsh-connect-qoder'

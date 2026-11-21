@@ -52,6 +52,25 @@ describe('client bundle module id', () => {
     expect(PLUGIN_ID).toBe(PACKAGE.name)
   })
 
+  it('REGRESSION: the Loader patch `name` must be the current package name', () => {
+    // 1.28.0 改名到 `@bokutake` 时，这里漏改了 —— `package.json`、
+    // README、 CHANGELOG 全都换了，`cordis.patch.yml` 的 `name:` 还留着
+    // `@dmh2002/dsh-connect-qoder`。静态测试全绿、CI 全绿，`dsh web` 真机
+    // 激活时才炸：
+    //
+    //   failed to import: Error [ERR_MODULE_NOT_FOUND]:
+    //   Cannot find package '@dmh2002/dsh-connect-qoder'
+    //
+    // `id` 必须保持不带 scope（`dsh-connect-qoder`）——它承担设置命名空间
+    // 与 `/plugins/<id>/…` 路由，改了会孤儿化老用户的已保存配置。但 `name`
+    // 是 profile 的 node_modules 里真正要解析的包，跟着发布名走。两者名字
+    // 相近，改一个漏一个的代价却差很多，所以在这里钉死。
+    const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+    const names = [...patch.matchAll(/^\s*name:\s*['"]?([^\s'"]+)['"]?\s*$/gm)].map(m => m[1])
+    expect(names).toContain(PACKAGE.name)
+    expect(names).not.toContain('@dmh2002/dsh-connect-qoder')
+  })
+
   it('is what the client bundle banner actually declares', () => {
     const banner = clientConfig().outputOptions?.banner
     expect(typeof banner).toBe('string')
