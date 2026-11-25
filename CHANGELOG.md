@@ -2,6 +2,37 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.28.2 (2026-11-25)
+
+> **只有文档。** 把 issue #2 的排查结论与**实测确认过**的 workaround 写进 README
+> （中英各一节）。
+
+### 文档
+
+- **README 新增「`403 + 10605 / RESOURCE_LIMIT` 也可能是内容拒绝，不是限流」（issue #2）。**
+  - **实测**：本机 3 轮共 10 次真实请求，模型 `dfmodel`（低倍率）。system 为
+    `You are an AI agent powered by DeepSeek Harness.` 时 **3/3** 复现
+    `HTTP 403 {"code":"10605",…,"serviceAvailable":false,"subCode":"RESOURCE_LIMIT"}`
+    （`queueCount: 0`）；把 `agent` 换成 `assistant`、**完全不带 system 消息**、
+    或换成 30 000 字符的 `z` 填充，三者全部正常返回。
+  - **排除了混杂因素**：上述三次里触发句都恰好是进程内第一个请求，因此补做一次
+    **顺序颠倒**的实验（安全句在前、触发句在后）—— 安全句成功、触发句仍 403，
+    结论不变。触发与请求顺序无关，是内容本身。
+  - **为什么不在插件里处理**：这个信封与「上游整体不可用」（issue #29 的现场）**逐字
+    相同**，字段层面无法区分（#29 那次是真宕机：插件探针不带 system 消息，
+    14 个模型全部如此）。把 `10605` 一律改判成内容策略会让真限流/真宕机既不记账号
+    也不退避。而改写所有请求的 system prompt 超出 provider 的职责范围。
+  - **写进 README 的判别方法**：插件自己的探针**不带 system 消息**（`probeUserMessage`），
+    所以「探针能过、真实会话过不去」本身就是内容相关的信号；「换个新会话试试」
+    **不是**有效判别，那句话在每个会话里都会注入。
+  - **workaround**：`includeHarnessIdentity: false` + `personaPrefix`，写法与 DSH 自带的
+    `dsh-sdk-minimal` bundle 一致（`id: system-prompt`）。
+  - **为什么不提供「把 identity 改成另一句」的配置项**：`harness:identity` 的文本
+    **没有**对外暴露的配置，只有开/关。全局层注册同名 section 会被宿主拒绝
+    （`prompt section "harness:identity" is already registered`），只有**每 agent 的
+    scope** 能覆盖同名槽位。所以能做的是「关掉 + 用 `personaPrefix` 补一句」，
+    不是「原地改写」。
+
 ## 1.28.1 (2026-11-21)
 
 > **修 1.28.0 的致命漏改：`cordis.patch.yml` 的 `name` 还留着旧包名，插件完全不激活。**

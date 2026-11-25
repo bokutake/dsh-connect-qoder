@@ -466,6 +466,38 @@ Market screenshots and GitHub README badges are two different mechanisms:
 - Per-model and batch tests **send real requests** and consume a little upstream credit. There is no "test all checked" button, and batch actions only touch accounts you explicitly checked into the pool.
 - **The standalone CLI depends on host-provided peers** (`@deepseek-ai/dsh-atomic-write` / `dsh-home-paths`). Locally pnpm installs them alongside the package and `pnpm exec dsh-connect-qoder …` works; if your pnpm configuration does not, the CLI reports `Cannot find package …`. Provider registration, the settings page and chat are unaffected — they run inside the host, which resolves those names. The workbuddy fix (host-first, fall back to a built-in copy) applies here and has not been ported yet.
 
+### `403 + 10605 / RESOURCE_LIMIT` can be a **content** refusal, not rate limiting (issue #2)
+
+Qoder CN can refuse a request by its **content** rather than by account or quota. One confirmed trigger is the whole `harness:identity` sentence in DSH's default system prompt (on by default):
+
+```
+You are an AI agent powered by DeepSeek Harness.
+```
+
+It comes back in an envelope **byte-for-byte identical** to "the upstream is not serving":
+
+```
+HTTP 403 {"code":"10605","message":"{…\"serviceAvailable\":false,\"subCode\":\"RESOURCE_LIMIT\"}"}
+```
+
+**The plugin does not rewrite your system prompt.** Those two causes share one envelope and cannot be told apart from its fields, and rewriting every request's system prompt is beyond what a provider should manage. So this is a diagnostic note only.
+
+**How to tell**: if **every** session fails with this envelope (not intermittently, not one model only) and turning `includeHarnessIdentity` off makes it work immediately, that is it. Note that "try a new conversation" is **not** a valid test here — the sentence is injected into every DSH session. The useful control is a request with **no system message at all**: the plugin's own probe has that shape, so "the probe passes but a real session does not" is itself the content signal.
+
+**Workaround**: turn that sentence off in the profile's `cordis.patch.yml` and add your own identity line via `personaPrefix`, then restart that profile's host process:
+
+```yaml
+- id: system-prompt
+  name: "@deepseek-ai/dsh-system-prompt"
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: "You are a helpful software engineer assistant."
+```
+
+`id: system-prompt` is the host's own entry id; DSH's bundled `dsh-sdk-minimal` uses exactly this shape, so you can compare against it.
+
+> **Why "replace the identity text" is not a plugin option**: the text of `harness:identity` has **no** exposed config — only on/off (`includeHarnessIdentity`). Registering a same-named section at global scope is rejected by the host (`prompt section "harness:identity" is already registered`); only a **per-agent scope** may shadow that slot. `personaPrefix` is the officially provided, free-form cell — so the available move is "turn it off and add your own", not "rewrite it in place".
+
 ## Privacy & screenshots
 
 **No real account data ever appears in the repository or the npm tarball.** This is a hard rule; the details live in [docs/PRIVACY.md](docs/PRIVACY.md):

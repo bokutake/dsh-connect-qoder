@@ -471,6 +471,38 @@ schemastery（`3.19.0`）还是没换，rc.3 的内容几乎全部来自一个 c
 - 模型可用性测试与批量测试**都会发出真实请求**，会消耗少量上游额度；没有「测试已勾选」这类批量按钮，批量动作只作用于你显式勾选进池的账号。
 - **独立 CLI 依赖宿主提供的 peer 包**（`@deepseek-ai/dsh-atomic-write` / `dsh-home-paths`）。本机实测：pnpm 会随包把它们装进 profile 的依赖树，`pnpm exec dsh-connect-qoder …` 与 npm 装的 tarball 都跑得通；但这取决于 pnpm 版本与 `auto-install-peers` 配置，若报 `Cannot find package '@deepseek-ai/dsh-atomic-write'` 就是这一层没装上。provider 注册、设置页与对话**都不受影响**（它们在宿主进程内，宿主负责解析这些名字）。同族 workbuddy 的修复方案（宿主优先、按需回落自带实现）适用于本项目，尚未移植。
 
+### `403 + 10605 / RESOURCE_LIMIT` 也可能是**内容**拒绝，不是限流（issue #2）
+
+Qoder CN 会按**请求内容**拒绝，而不是按账号或额度。已实测确认的一个触发点是 DSH 默认 system prompt 里 `harness:identity` 那一整句（默认开启）：
+
+```
+You are an AI agent powered by DeepSeek Harness.
+```
+
+它返回的信封与「上游整体不可用」**逐字相同**：
+
+```
+HTTP 403 {"code":"10605","message":"{…\"serviceAvailable\":false,\"subCode\":\"RESOURCE_LIMIT\"}"}
+```
+
+**插件不替你改 system prompt**：这两件事共用一个信封，无法从字段区分；而改写所有请求的系统提示词超出了 provider 该管的范围。所以这里只给排查方法。
+
+**先这样判断**：如果**每个**会话都以这个信封失败（不是偶发、也不是某个模型特有），关掉 `includeHarnessIdentity` 之后就立刻正常，那基本就是它。注意「换个新会话试试」在这里**不是**有效的判别 —— 那句话在每一个 DSH 会话里都会注入。真正有用的对照是**不带 system 消息**的请求：插件自己的探针就是这种形状，所以「探针能过、真实会话过不去」本身就是内容相关的信号。
+
+**workaround**：在 profile 的 `cordis.patch.yml` 里关掉那一句，并用 `personaPrefix` 补一句你自己的身份描述，然后重启该 profile 的宿主进程：
+
+```yaml
+- id: system-prompt
+  name: "@deepseek-ai/dsh-system-prompt"
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: "You are a helpful software engineer assistant."
+```
+
+`id: system-prompt` 是宿主自己的 entry id；DSH 自带的 `dsh-sdk-minimal` bundle 用的就是这套写法，可以直接对照。
+
+> **为什么不把「换一句 identity」做成插件配置项**：`harness:identity` 的文本**没有**对外暴露的配置项，只有开/关（`includeHarnessIdentity`）。在全局层注册同名 section 会被宿主拒绝（`prompt section "harness:identity" is already registered`），只有**每 agent 的 scope** 才能覆盖同名槽位。`personaPrefix` 是官方提供的、可自由填写的那一格 —— 所以能做的是「关掉 + 补一句」，不是「原地改写」。
+
 ## 隐私与截图
 
 **仓库与 npm 包里不出现任何真实账号数据。** 这一条是硬约束，规则与操作细则见 [docs/PRIVACY.md](docs/PRIVACY.md)：
