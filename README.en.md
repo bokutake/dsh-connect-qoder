@@ -166,6 +166,20 @@ Besides the settings PAT and the environment variable, each region has a local v
 - `logout [--region cn|global]` clears that region's vault accounts and pool measurements (`.qoder-accounts.<region>.json` and `.qoder-pool.<region>.json`).
 - Membership, the batch actions, and the failover rules are covered in the [Account pool](#account-pool) section.
 
+### Catalog channel: `catalogChannel` (default `cli`)
+
+The upstream decides which model catalog to send based on the **client channel**. The default `cli` behaves exactly as before; set it to `desktop` and the plugin sends `cosy-clienttype: 10` on the `/model/list` request **only**, which surfaces the campaign models available to the desktop/App channel (such as HungerG).
+
+**Chat requests always use the CLI channel.** Measured: with ct=10 the upstream switches to a different reasoning and truncation path (the same request goes from 4 tokens / 0 reasoning to 71 / 67, not even honouring the output limit), which is not the behaviour a chat plugin should adopt.
+
+These channel-only models are **never pre-selected**, even when the upstream marks them `is_free: true`: on some plans they are billed as ordinary models, and the plugin cannot tell before making a request. Tick one in the card if you want to use it.
+
+```yaml
+regions:
+  cn:
+    catalogChannel: desktop   # cli (default) | desktop
+```
+
 ## Account pool
 
 One machine often holds several Qoder accounts (several PATs). The **account pool** collapses that into single clicks: check accounts into the pool, then "Check in all accounts" or "Test all accounts"; switch on **Enable account pool** and the plugin automatically fails over to another account when a request fails upstream.

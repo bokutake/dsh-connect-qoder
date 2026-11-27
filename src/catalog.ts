@@ -195,6 +195,18 @@ export interface QoderModelInfo {
   isFree: boolean
   isNew: boolean
   /**
+   * 「只在上游的渠道桶里出现」—— 它不在 `chat` 桶里，只在 `assistant` / `app`
+   * 桶里（issue #3）。`chat` 里也有同名条目时**不设**这个标记。
+   *
+   * 为什么值得单独记：这类模型（如 HungerG）是**活动模型**，上游按客户端通道
+   * 决定发不发，而且实测在部分套餐上按普通模型计费（`billable: true`）。插件
+   * 没有请求前的判据，所以它们**不进自动勾选** —— 见 `initialEnabledKeys`。
+   *
+   * 不落盘：这是"这一次目录从哪个桶拿到"的事实，重启后重新拉一次就有；写进
+   * `lastCatalog` 反而会让旧快照带着过期的渠道归属。
+   */
+  channelOnly?: boolean
+  /**
    * 网关声明可用的上下文档位（`context_config` 各项的 token_count，升序）。
    * 不存在时无档位可选，卡片不渲染预算选择器。
    */
@@ -390,6 +402,7 @@ export function parseUpstreamModel(raw: QoderUpstreamModel): QoderModelInfo {
     isDefault: raw.is_default,
     isFree: raw.is_free === true,
     isNew: false,
+    ...raw.channelOnly === true ? { channelOnly: true } : {},
     ...tiersField(tiers === undefined ? undefined : mapContextTiers(tiers)),
     ...promotion === undefined ? {} : { promotion },
   }
@@ -656,7 +669,11 @@ export function withoutForeignRegionModels(
  */
 export function initialEnabledKeys(models: QoderModelInfo[]): Set<string> {
   return new Set(
-    models.filter(m => !isRouterModelId(m.key) && (m.isDefault || m.isFree)).map(m => m.key),
+    models
+      // 渠道独有模型不自动勾（issue #3）：它可能是计费的，而 `billable` 只能在
+      // 请求之后才知道。自动勾选等于替用户做花钱的决定 —— 留给用户自己点。
+      .filter(m => m.channelOnly !== true && !isRouterModelId(m.key) && (m.isDefault || m.isFree))
+      .map(m => m.key),
   )
 }
 

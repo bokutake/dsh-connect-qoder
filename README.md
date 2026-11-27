@@ -166,6 +166,20 @@ dsh plugin --profile desktop add ~/DshProject/dsh-connect-qoder
 - `logout [--region cn|global]` 会清除指定区域的 vault 账号与账号池测量副本（`$DSH_HOME/.qoder-accounts.<region>.json` 与 `.qoder-pool.<region>.json`）。
 - 勾选成员、一键签到、一键测试与自动换号的规则见[账号池](#账号池)。
 
+### 目录通道：`catalogChannel`（默认 `cli`）
+
+上游按**客户端通道**决定下发哪一份模型目录。默认 `cli`，与之前完全一致；设成 `desktop` 后，插件只在 `/model/list` 这一个请求上带 `cosy-clienttype: 10`，从而多拿到只在桌面/App 通道下发的活动模型（如 HungerG）。
+
+**聊天请求永远是 CLI 通道。** 实测 ct=10 会让上游换一套推理与截断行为（同一请求从 4 token / 0 reasoning 变成 71 / 67，连输出上限都不遵守），那不是对话该有的行为。
+
+这些「渠道独有」的模型**不会自动勾选**，即使上游标着 `is_free: true` —— 它们在部分套餐上按普通模型计费，而插件无法在请求前判断。要用就在卡片里自己勾一次。
+
+```yaml
+regions:
+  cn:
+    catalogChannel: desktop   # cli（默认）| desktop
+```
+
 ## 账号池
 
 一台机器上往往有多个 Qoder 账号（多个 PAT）。**账号池**把这些账号收成一次点击：勾进池子，然后「一键签到所有账号」或「一键测试所有账号」；再打开**启用账号池**，插件就会在请求失败时自动换号接着跑。

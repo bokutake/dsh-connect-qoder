@@ -3080,3 +3080,76 @@ describe('issue #47: 无凭据的 /campaigns 不是上游 502', () => {
     expect(answer.error).toBe('未配置凭据')
   })
 })
+
+/**
+ * issue #3 原因 C：**目录刷新完必须通知客户端**。
+ *
+ * 客户端的模型选择器只在收到 `llm/adapters-updated` / `llm/models-updated` 等
+ * 事件时重拉目录（`dsh-client-ui-model-selection` 的 service 订阅了它们）。而
+ * 插件刷新目录时只调了 `invalidateCatalog()` —— 那是插件自己 adapter 的
+ * `invalidate()`，只重建 `profiles` Map，**不发任何事件**。于是动态目录永远到
+ * 不了选择器，用户看到的是首次加载时的静态兜底目录。
+ *
+ * 宿主侧的事实：`dsh-llm` 对 adapter 句柄的 `replace()` 会 publish
+ * `llm/adapters-updated`（其源码注释：*"`llm/adapters-updated` is published,
+ * so a `replace` announces itself"*）。所以这里钉的是"刷新后必须再 replace 一次"，
+ * 而不是"必须调某个函数" —— 前者才是宿主真正认的动作。
+ */
+describe('目录刷新后要通知客户端（issue #3 原因 C）', () => {
+  it('刷新路由跑完后会再次 publish llm/adapters-updated', async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input)
+      if (url.includes('jobToken')) {
+        return new Response(JSON.stringify({
+          id: 'u1', name: 'Tester', expireTime: Date.now() + 86_400_000,
+          securityOauthToken: 'jt-test', refreshToken: 'rt-test',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('/model/list')) {
+        return new Response(JSON.stringify({
+          chat: [{ key: 'dfmodel', display_name: 'DeepSeek-Flash', price_factor: 0.1 }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    try {
+      const routes: CapturedRoute[] = []
+      const ctx = new Context()
+      context = ctx
+      await ctx.plugin(LlmRuntime)
+      await ctx.plugin(MemorySettings)
+      ctx.provide('webServer', {
+        register: (entry: CapturedRoute) => { routes.push(entry); return () => {} },
+      } as never)
+
+      // 直接数宿主**真正发布**的事件。这比包住 `registerAdapter` 更接近事实：
+      // 客户端订阅的就是这个事件名，而 `replace()` 只是它的触发器。
+      let catalogUpdates = 0
+      ;(ctx as unknown as { on(name: string, listener: () => void): unknown })
+        .on('llm/adapters-updated', () => { catalogUpdates += 1 })
+
+      await mountQoder(ctx, {
+        regions: {
+          cn: { pat: 'pt-refresh-notify-aaaaaaaa', enabledModelKeys: ['dfmodel'] },
+          global: { pat: '' },
+        },
+      })
+      await waitFor(() => routes.some(route => route.path.includes('/models/refresh')))
+      // 启动路径不计数：`applySelection` 跑在适配器注册**之前**，那时
+      // `registration[region].adapter` 还是 undefined，`syncRegionRegistration`
+      // 直接 continue。所以基线就是 0，这里清零只为读起来明确。
+      catalogUpdates = 0
+      const refresh = routes.find(route => route.path.includes('/models/refresh'))!
+      const res = fakeResponse()
+      await refresh.handler(
+        { method: 'POST', url: `${refresh.path}?region=cn`, headers: { origin: 'http://127.0.0.1:19387' } },
+        res.node,
+      )
+      await waitFor(() => catalogUpdates > 0)
+      expect(catalogUpdates).toBeGreaterThan(0)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+})

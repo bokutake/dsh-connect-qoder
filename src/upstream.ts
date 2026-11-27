@@ -259,6 +259,23 @@ const MODELS_PATH = '/algo/api/v2/model/list?Encode=1'
 const JOB_TOKEN_PATH = '/algo/api/v3/user/jobToken?Encode=1'
 
 /**
+ * 目录响应里我们读哪几个桶，顺序即优先级（issue #3）。
+ *
+ * 上游的 `/model/list` 返回的是**按场景分的对象**，不是模型数组：
+ *
+ * ```text
+ * chat(14) developer(12) assistant(14) inline(10) quest(12) qwork(10)
+ * experts(6) qwake(14) app(14) qcode(3) byok_teams(0) byok_enterprise(0)
+ * ```
+ *
+ * 此前只读 `chat`。实测（ct=10）：`chat ⊆ assistant`、`chat ⊆ app`，两者都只多
+ * 一个 `hmodel`（HungerG）；`qwake` 与 `chat` 完全相同，其余桶都是 `chat` 的
+ * **子集**。所以并这三个桶恰好等于"`chat` + 活动模型"，不会把 IDE / 团队场景的
+ * 残缺列表（`qcode` 只有 3 条）混进来。
+ */
+const CATALOG_BUCKETS = ['chat', 'assistant', 'app'] as const
+
+/**
  * `business.product` 的默认值：`cli`。
  *
  * 官方客户端有两条产品线，**默认值不同**：
@@ -507,6 +524,12 @@ export interface QoderUpstreamModel {
   max_output_tokens: number | undefined
   thinking_config: Record<string, unknown> | undefined
   context_config: Record<string, { token_count: number; is_default?: boolean }> | undefined
+  /**
+   * 该模型**只出现在渠道桶里**（`assistant` / `app`），`chat` 桶没有它（issue #3）。
+   *
+   * 不设这个字段 = 它来自 `chat` 桶（或同名条目在 `chat` 里也有）。
+   */
+  channelOnly?: boolean
   /** 其余字段原样保留。 */
   raw: Record<string, unknown>
 }
@@ -1253,7 +1276,9 @@ export class QoderUpstreamClient {
    * `fetchModels` 一样用 bearer。失败原因只记 debug 级别 —— 它是常态，不是故障。
    */
   private async discoverNodes(holder: QoderSessionHolder, signal?: AbortSignal): Promise<void> {
-    if (this.endpoints.isFresh()) return
+    // 失败冷却也要跳过（issue #3）：`isFresh()` 只在成功时为真，于是
+    // `/region/endpoints` 对某个账号 404 时，每个聊天请求都会再打一次发现。
+    if (this.endpoints.isFresh() || this.endpoints.isCoolingDown()) return
     const url = `${this.region.openapi}${REGION_ENDPOINTS_PATH}`
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('endpoint election timed out')), ENDPOINTS_TIMEOUT_MS)
@@ -1270,6 +1295,8 @@ export class QoderUpstreamClient {
       this.endpoints.write(parsed)
     } catch (error) {
       // 发现是优化项：任何失败都退回默认网关，不向调用方冒泡。
+      // 同时记一次失败，让接下来一分钟内别再重试（issue #3）。
+      this.endpoints.recordFailure()
       this.log(`节点发现失败，继续用默认网关：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       clearTimeout(timer)
@@ -1297,16 +1324,48 @@ export class QoderUpstreamClient {
    * 拉取模型目录。响应形状（服务端 snake_case）：
    * `{"chat":[{key, display_name, enable, is_vl, is_default, ...}], ...}`
    */
-  async fetchModels(credential: string, signal?: AbortSignal): Promise<QoderUpstreamModel[]> {
+  async fetchModels(
+    credential: string,
+    signal?: AbortSignal,
+    options: {
+      /**
+       * 这一条目录请求用哪个 `cosy-clienttype`（默认 {@link COSY_CLIENT_TYPE}）。
+       *
+       * issue #3：上游按通道决定"给不给活动模型"。实测同一套头、只把该值从 `5`
+       * 改成 `10`，`assistant` 与 `app` 各多一条 `hmodel`，其余十个桶分毫不变。
+       * **只给目录请求换** —— 聊天请求实测在 ct=10 下会走另一套推理与截断路径
+       * （同一请求 4 token / 0 reasoning → 71 / 67），那不是我们要的对话行为。
+       */
+      clientType?: string
+    } = {},
+  ): Promise<QoderUpstreamModel[]> {
     const holder = await this.ensureSession(credential)
     // 目录同样可能按节点分区下发；先尝试发现，失败就用默认网关（见 discoverNodes）。
     await this.discoverNodes(holder, signal)
     const modelsBase = this.endpoints.read()?.openapi[0] ?? `${this.region.gateway}/`
     const url = `${modelsBase.replace(/\/$/, '')}${this.region.modelsPath}`
-    const data = await this.bearerGet(holder, url, signal)
-    const chat = Array.isArray(data.chat) ? data.chat : []
-    return chat
-      .map((entry): QoderUpstreamModel | undefined => {
+    const data = await this.bearerGet(
+      holder,
+      url,
+      signal,
+      options.clientType === undefined ? {} : { 'cosy-clienttype': options.clientType },
+    )
+    // 见 {@link CATALOG_BUCKETS}：目录是分桶对象，只读 `chat` 会静默丢掉活动
+    // 模型。同 key 以**先出现者**为准（`chat` 在第一个），因为实测同一个 key 在
+    // 不同桶里内容不同 —— 让后出现的桶覆盖会让价格与上下文档位随桶序漂移。
+    const collected: Array<{ entry: unknown, channelOnly: boolean }> = []
+    const seen = new Set<string>()
+    for (const [index, bucket] of CATALOG_BUCKETS.entries()) {
+      const list = Array.isArray(data[bucket]) ? data[bucket] as unknown[] : []
+      for (const entry of list) {
+        const key = (entry as { key?: unknown } | null)?.key
+        if (typeof key !== 'string' || key === '' || seen.has(key)) continue
+        seen.add(key)
+        collected.push({ entry, channelOnly: index > 0 })
+      }
+    }
+    return collected
+      .map(({ entry, channelOnly }): QoderUpstreamModel | undefined => {
         if (!entry || typeof entry !== 'object') return undefined
         const raw = entry as Record<string, unknown>
         const key = typeof raw.key === 'string' ? raw.key : ''
@@ -1327,6 +1386,7 @@ export class QoderUpstreamClient {
           context_config: typeof raw.context_config === 'object'
             ? raw.context_config as Record<string, { token_count: number; is_default?: boolean }>
             : undefined,
+          ...channelOnly ? { channelOnly: true } : {},
           raw,
         }
       })
@@ -2021,7 +2081,20 @@ export class QoderUpstreamClient {
     return undefined
   }
 
-  private async bearerGet(holder: QoderSessionHolder, url: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  /**
+   * 带 cosy bearer 的 GET。
+   *
+   * `extraHeaders` 只用于**单条请求的协议标签覆盖**（issue #3 的目录通道），
+   * 排在最后，所以可以盖掉 `DEFAULT_HEADERS` 里的同名键。它不参与签名：
+   * 签名材料是 `md5(payloadB64 \n cosyKey \n date \n body \n pathSig)`，里
+   * 面没有任何请求头。
+   */
+  private async bearerGet(
+    holder: QoderSessionHolder,
+    url: string,
+    signal?: AbortSignal,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<Record<string, unknown>> {
     const pathSig = pathSigFrom(url)
     const payloadB64 = buildPayloadB64(holder.session.info, this.clientVersion)
     const date = String(Math.floor(Date.now() / 1000))
@@ -2036,6 +2109,7 @@ export class QoderUpstreamClient {
       authorization: bearer,
       'cosy-version': this.clientVersion,
       ...this.machineHeaders(holder),
+      ...extraHeaders,
     }
     const resp = await this.fetchImpl(url, {
       headers,

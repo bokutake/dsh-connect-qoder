@@ -599,3 +599,38 @@ describe('静态兜底目录', () => {
     }
   })
 })
+
+/**
+ * issue #3 层 2：渠道独有模型（只在 `assistant`/`app` 桶里出现，`chat` 没有）
+ * **不自动勾选**。
+ *
+ * 理由不是"丑"，而是钱：这类模型（如 HungerG）在部分套餐上由上游按普通模型
+ * 计费（实测 `billable: true`），而插件无法在请求前判断某个账号是否免费 ——
+ * `billable` 只能事后从 SSE 读。把"自动勾选"拿掉，方案就从"替用户花钱"降级成
+ * "给一个看得见但要点一下的选项"。
+ */
+describe('渠道独有模型不自动勾选（issue #3）', () => {
+  it('channelOnly 的模型即使 is_free 也不进初始勾选', () => {
+    const base = fallbackModelInfo(QODER_FALLBACK_MODELS[0]!)
+    const models = [
+      { ...base, key: 'qfmodel', isFree: true },
+      { ...base, key: 'hmodel', isFree: true, channelOnly: true },
+    ]
+    expect([...initialEnabledKeys(models)]).toEqual(['qfmodel'])
+  })
+
+  it('非渠道模型照旧按 isFree / isDefault 自动勾选', () => {
+    const base = fallbackModelInfo(QODER_FALLBACK_MODELS[0]!)
+    const models = [
+      { ...base, key: 'qfmodel', isFree: true, isDefault: false },
+      { ...base, key: 'dmodel', isFree: false, isDefault: true },
+      { ...base, key: 'kmodel', isFree: false, isDefault: false },
+    ]
+    expect([...initialEnabledKeys(models)].sort()).toEqual(['dmodel', 'qfmodel'])
+  })
+
+  it('parseUpstreamModel 把 channelOnly 带进目录层', () => {
+    expect(parseUpstreamModel({ ...rawModel(), channelOnly: true }).channelOnly).toBe(true)
+    expect(parseUpstreamModel(rawModel()).channelOnly).toBeUndefined()
+  })
+})

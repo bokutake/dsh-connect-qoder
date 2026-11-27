@@ -70,6 +70,19 @@ export const REGION_ENDPOINTS_PATH = '/api/v3/service/region/endpoints'
 /** 与客户端 `B9i = 3e5` 同值：5 分钟。 */
 export const ENDPOINTS_TTL_MS = 5 * 60 * 1000
 
+/**
+ * 发现**失败**后的冷却：这是我们自己的退避，不是上游的承诺（issue #3）。
+ *
+ * 现场：`/api/v3/service/region/endpoints` 对部分账号回 404。发现失败本身是
+ * 安全的（退回默认网关），但 `isFresh()` 只在**成功**时为真，于是一个 404 会
+ * 让每个请求都重打一次发现 —— `discoverNodes()` 在 `chatStream` 与
+ * `fetchModels` 里各调一次，等于每个回合多一次往返、多一条 warn。
+ *
+ * 60 秒而不是 5 分钟：失败通常是**账号级**的（这个号没有节点表），不像成功值
+ * 那样值得缓存很久；它只用来挡住"同一场对话里每个请求都重试一次"。
+ */
+export const ENDPOINTS_FAILURE_COOLDOWN_MS = 60 * 1000
+
 /** 与客户端选举超时同量级：发现失败要立刻退回默认，不能拖慢首包。 */
 export const ENDPOINTS_TIMEOUT_MS = 1_000
 
@@ -170,12 +183,33 @@ export function orderWithLastFirst(nodes: string[], lastUsed: string | undefined
 export class QoderEndpointCache {
   private nodes: QoderDiscoveredNodes | undefined
   private fetchedAtMs = 0
+  /** 最近一次**失败**的时刻；`undefined` = 还没失败过。 */
+  private failedAtMs: number | undefined
 
-  constructor(private readonly ttlMs: number = ENDPOINTS_TTL_MS) {}
+  constructor(
+    private readonly ttlMs: number = ENDPOINTS_TTL_MS,
+    private readonly failureCooldownMs: number = ENDPOINTS_FAILURE_COOLDOWN_MS,
+  ) {}
 
   /** 缓存是否仍然新鲜。 */
   isFresh(nowMs = Date.now()): boolean {
     return this.nodes !== undefined && nowMs - this.fetchedAtMs < this.ttlMs
+  }
+
+  /**
+   * 是否处在**失败冷却**里 —— 处在冷却中就不要再去打发现请求。
+   *
+   * 与 {@link isFresh} 分开：一个是"值还新鲜"，一个是"上次失败了，先别试"。
+   * 合并成一个布尔会让调用方无法区分这两种"别问了"，而它们的到期语义不同。
+   */
+  isCoolingDown(nowMs = Date.now()): boolean {
+    if (this.failedAtMs === undefined) return false
+    return nowMs - this.failedAtMs < this.failureCooldownMs
+  }
+
+  /** 记一次发现失败：接下来 `failureCooldownMs` 内不再重试。 */
+  recordFailure(nowMs = Date.now()): void {
+    this.failedAtMs = nowMs
   }
 
   /** 读缓存（不新鲜则为 undefined）。 */
@@ -187,11 +221,14 @@ export class QoderEndpointCache {
   write(nodes: QoderDiscoveredNodes, nowMs = Date.now()): void {
     this.nodes = nodes
     this.fetchedAtMs = nowMs
+    // 成功即解除失败冷却：这次是真的拿到了表。
+    this.failedAtMs = undefined
   }
 
   /** 清空（登出/换账号时用：节点表按账号下发）。 */
   clear(): void {
     this.nodes = undefined
     this.fetchedAtMs = 0
+    this.failedAtMs = undefined
   }
 }

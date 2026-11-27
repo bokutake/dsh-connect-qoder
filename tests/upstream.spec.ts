@@ -2025,3 +2025,91 @@ describe('节点发现与 inference 节点轮换', () => {
     expect(chatUrls).toHaveLength(1)
   })
 })
+
+/**
+ * issue #3：目录响应不是模型数组，而是**按场景分的桶**；插件此前只读 `chat`。
+ *
+ * 本条只钉「读取与去重」这一层，不钉上游到底会不会下发活动模型 —— 那取决于
+ * `cosy-clienttype`，由下一组用例单独覆盖。
+ */
+describe('目录分桶：chat ∪ assistant ∪ app（issue #3）', () => {
+  /** 按桶返回目录，并记录每个请求实际发出的头。 */
+  function captureBuckets(buckets: Record<string, unknown>): {
+    calls: Array<{ url: string, headers: Record<string, string> }>
+    client: QoderUpstreamClient
+  } {
+    const calls: Array<{ url: string, headers: Record<string, string> }> = []
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      const target = String(url)
+      calls.push({ url: target, headers: Object.fromEntries(new Headers(init?.headers ?? {}).entries()) })
+      if (target.includes('jobToken')) {
+        return new Response(JSON.stringify({
+          id: 'u', name: 'n', expireTime: Date.now() + 1_000_000,
+          securityOauthToken: 'jt-TEST', refreshToken: 'r', userType: 'personal_standard',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (target.includes('/model/list')) {
+        return new Response(JSON.stringify(buckets), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+    return { calls, client: new QoderUpstreamClient('cn', { fetch: fetchImpl, clientVersion: '1.1.94' }) }
+  }
+
+  const entry = (key: string, name: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    key, display_name: name, enable: true, price_factor: 0, ...extra,
+  })
+
+  it('读 chat ∪ assistant ∪ app，而不是只读 chat', async () => {
+    const { client } = captureBuckets({
+      chat: [entry('qfmodel', 'Qwen3.8-Flash')],
+      assistant: [entry('qfmodel', 'Qwen3.8-Flash'), entry('hmodel', 'HungerG', { is_free: true })],
+      app: [entry('hmodel', 'HungerG')],
+    })
+    const models = await client.fetchModels('pt-x')
+    expect(models.map(model => model.key).sort()).toEqual(['hmodel', 'qfmodel'])
+  })
+
+  it('同一 key 出现在多个桶时以 chat 那条为准，并标出只在渠道桶出现的模型', async () => {
+    // 实测：`qmodel_latest` 在 8 个桶里出现、内容不止一种（context_config /
+    // is_default / tags / thinking_config 都不同）。去重必须先出现者胜，而
+    // `chat` 排第一 —— 否则同一个模型的价格与上下文会随桶的顺序漂移。
+    const { client } = captureBuckets({
+      chat: [entry('qfmodel', 'Chat 版', { price_factor: 0.1 })],
+      assistant: [entry('qfmodel', 'Assistant 版', { price_factor: 9 })],
+      app: [entry('hmodel', 'HungerG')],
+    })
+    const models = await client.fetchModels('pt-x')
+    const fromChat = models.find(model => model.key === 'qfmodel')!
+    expect(fromChat.display_name).toBe('Chat 版')
+    expect(fromChat.channelOnly).toBeUndefined()
+    const channelOnly = models.find(model => model.key === 'hmodel')!
+    expect(channelOnly.channelOnly).toBe(true)
+  })
+
+  it('只给未知桶时不崩，返回空目录', async () => {
+    const { client } = captureBuckets({ somethingElse: [entry('qfmodel', 'X')] })
+    expect(await client.fetchModels('pt-x')).toEqual([])
+  })
+
+  it('目录请求可用 clientType 覆盖通道，聊天请求永远是 CLI 通道', async () => {
+    const { calls, client } = captureBuckets({ chat: [entry('qfmodel', 'Qwen3.8-Flash')] })
+    await client.fetchModels('pt-x', undefined, { clientType: '10' })
+    const models = calls.find(call => call.url.includes('/model/list'))!
+    expect(models.headers['cosy-clienttype']).toBe('10')
+    // 层 3：聊天永不换身份 —— 实测 ct=10 会切换上游的推理与截断路径
+    // （同一请求 4 token / 0 reasoning 变成 71 / 67），那不是我们要的对话行为。
+    await client.chatStream('pt-x', 'qfmodel', [{ role: 'user', content: 'hi' }], { onDelta: () => {} })
+    const chat = calls.find(call => call.url.includes('agent_chat_generation'))!
+    expect(chat.headers['cosy-clienttype']).toBe('5')
+  })
+
+  it('不传 clientType 时目录仍用内置 CLI 通道（默认行为一个字节不变）', async () => {
+    const { calls, client } = captureBuckets({ chat: [entry('qfmodel', 'Qwen3.8-Flash')] })
+    await client.fetchModels('pt-x')
+    const models = calls.find(call => call.url.includes('/model/list'))!
+    expect(models.headers['cosy-clienttype']).toBe('5')
+  })
+})

@@ -120,3 +120,40 @@ describe('QoderEndpointCache', () => {
     expect(ENDPOINTS_TTL_MS).toBe(5 * 60 * 1000)
   })
 })
+
+/**
+ * issue #3 附带发现：`/api/v3/service/region/endpoints` 对部分账号 404。
+ *
+ * 发现失败本身是安全的（退回默认网关），但此前**没有负缓存** —— `isFresh()`
+ * 只有成功时才为真，于是一个 404 会让**每个聊天请求**都多打一次发现请求
+ * （`discoverNodes` 在 `chatStream` 与 `fetchModels` 里各调一次），并每轮
+ * 刷一条 warn。这里钉住"失败后短时间内不再重试"。
+ */
+describe('节点发现失败后的冷却（issue #3）', () => {
+  const success = { center: [], inference: [], securityInference: [], openapi: [] }
+
+  it('失败后进入冷却，到点后恢复', () => {
+    const cache = new QoderEndpointCache(5 * 60_000, 60_000)
+    expect(cache.isCoolingDown(0)).toBe(false)
+    cache.recordFailure(0)
+    expect(cache.isFresh(1_000)).toBe(false)
+    expect(cache.isCoolingDown(1_000)).toBe(true)
+    expect(cache.isCoolingDown(59_999)).toBe(true)
+    expect(cache.isCoolingDown(60_001)).toBe(false)
+  })
+
+  it('写成功会清掉失败冷却', () => {
+    const cache = new QoderEndpointCache(5 * 60_000, 60_000)
+    cache.recordFailure(0)
+    cache.write(success, 1)
+    expect(cache.isCoolingDown(2)).toBe(false)
+    expect(cache.isFresh(2)).toBe(true)
+  })
+
+  it('clear 同时清掉失败冷却（登出/换账号后要能重新发现）', () => {
+    const cache = new QoderEndpointCache(5 * 60_000, 60_000)
+    cache.recordFailure(0)
+    cache.clear()
+    expect(cache.isCoolingDown(1)).toBe(false)
+  })
+})

@@ -298,6 +298,9 @@ const regionRetryConfig = z.object({
   queueWaitMs: z.number().min(0).default(60_000).description('上游排队时插件自己等待的上限毫秒（0 = 关掉）'),
 })
 
+/** 目录请求用的客户端通道（issue #3）。 */
+export type QoderCatalogChannel = 'cli' | 'desktop'
+
 const regionConfig = z.object({
   /** 本区域 PAT。留空读环境变量；env 与 vault 承接连带选择。 */
   pat: z.string().default('').description('Qoder PAT（留空时读取环境变量）'),
@@ -305,6 +308,15 @@ const regionConfig = z.object({
   enabled: z.boolean().default(true),
   /** 用户显式选择的账号 id（'' = 自动：settings → env → vault）。 */
   accountId: z.string().default(''),
+  /**
+   * 目录请求用哪个客户端通道（issue #3）。默认 `cli`，与 1.28.x 完全一致。
+   *
+   * 设成 `desktop` 才会向 `/model/list` 发 `cosy-clienttype: 10`，从而拿到只在
+   * `assistant` / `app` 桶里下发的活动模型（如 HungerG）。**只改目录请求**：
+   * 聊天请求永远是 CLI 通道。这些模型不自动勾选，需要你在卡片里自己勾一次。
+   */
+  catalogChannel: z.union([z.const('cli'), z.const('desktop')]).default('cli')
+    .description('目录请求的客户端通道（cli = 默认；desktop 才下发活动模型，且这些模型不自动勾选）'),
   /** 是否在主界面展示积分（composer 面板）；opt-out。 */
   showCreditsInMainUi: z.boolean().default(true),
   /**
@@ -657,6 +669,26 @@ export function queueWaitMsOf(
 function regionCreditsShown(config: { regions?: Record<string, unknown> | null }, region: QoderRegion): boolean {
   const state = regionStateOf(config, region)
   return state.showCreditsInMainUi !== false
+}
+
+/**
+ * 目录请求用哪个客户端通道（issue #3）。默认 `cli`。
+ *
+ * **只影响 `/model/list` 这一个请求**，聊天永远走 CLI 通道：实测 ct=10 会让上游
+ * 换一套推理与截断行为（同一请求 4 token / 0 reasoning → 71 / 67），那是另一个
+ * 产品面，不该偷偷用在一个对话插件上。
+ *
+ * `desktop` 能拿到只在 `assistant` / `app` 桶里下发的活动模型（如 HungerG）。
+ * 但那是**活动权益**，上游按客户端通道 + 套餐决定发不发，实测在部分套餐上按
+ * 普通模型计费。所以这个开关默认关，且这些模型**不进自动勾选** —— 见
+ * `initialEnabledKeys`。默认留给用户自己决定要不要按这个按钮。
+ */
+export function catalogChannelOf(
+  config: { regions?: Record<string, unknown> | null },
+  region: QoderRegion,
+): QoderCatalogChannel {
+  const state = regionStateOf(config, region)
+  return state.catalogChannel === 'desktop' ? 'desktop' : 'cli'
 }
 
 /**
@@ -1944,11 +1976,22 @@ function displayModels(region: QoderRegion): readonly QoderModelInfo[] {
   // 目录 / 注册同步
   // -------------------------------------------------------------------------
 
+  /**
+   * 目录请求的通道选项（issue #3）：默认**不覆盖**，只有 `desktop` 才发 10。
+   *
+   * 抽成一个函数而不是两处内联，是因为 `discoverModels`（只读探测）与
+   * `refreshRegionCatalog`（真正安装）必须用同一条通道 —— 两处给出不同答案会
+   * 出现"探测看到 hmodel、刷新后没有"这种最难查的不一致。
+   */
+  function catalogRequestOptionsOf(region: QoderRegion): { clientType?: string } {
+    return catalogChannelOf(config, region) === 'desktop' ? { clientType: '10' } : {}
+  }
+
   /** On-demand model read for discovery + refresh. */
   async function discoverModels(region: QoderRegion, signal?: AbortSignal): Promise<QoderModelInfo[]> {
     const serving = await resolveServing(region)
     if (!serving) return []
-    const upstream = await stacks[region].upstream.fetchModels(serving.pat, signal)
+    const upstream = await stacks[region].upstream.fetchModels(serving.pat, signal, catalogRequestOptionsOf(region))
     const parsed = upstream.map(parseUpstreamModel)
     return applyContextBudgets(parsed, contextBudgetsOf(config, region))
   }
@@ -1958,7 +2001,7 @@ function displayModels(region: QoderRegion): readonly QoderModelInfo[] {
    * 路由层据此答 500，启动路径自己吞掉落回兜底目录。
    */
   async function refreshRegionCatalog(region: QoderRegion, pat: string): Promise<QoderModelInfo[]> {
-    const upstream = await stacks[region].upstream.fetchModels(pat)
+    const upstream = await stacks[region].upstream.fetchModels(pat, undefined, catalogRequestOptionsOf(region))
     const parsed = upstream.map(parseUpstreamModel)
     const withTiers = applyContextBudgets(parsed, contextBudgetsOf(config, region))
     const stamped = stampRuntimeCatalog(config, region, withTiers)
@@ -1976,6 +2019,17 @@ function displayModels(region: QoderRegion): readonly QoderModelInfo[] {
     cardCatalog[region] = stamped
     stacks[region].catalog.set(deriveCatalog(stamped, saved))
     invalidateCatalog()
+    // **刷新完必须通知客户端**（issue #3 原因 C）。
+    //
+    // 客户端的选择器只在收到 `llm/adapters-updated` / `llm/models-updated` 时
+    // 重拉目录，而 `invalidateCatalog()` 只重建插件自己 adapter 的 `profiles`
+    // Map —— **不发任何事件**。于是动态目录永远到不了选择器，用户看到的是首次
+    // 加载时的静态兜底目录（实测：卡片里能看到新模型、选择器里没有）。
+    //
+    // `replace()` 是宿主认的那个动作（`dsh-llm` 源码注释：*"`llm/adapters-updated`
+    // is published, so a `replace` announces itself"*），且适配器注册是幂等的：
+    // 重复 replace 只为通知，不改状态。所以复用 `syncRegionRegistration`。
+    syncRegionRegistration(config)
     return stamped
   }
 

@@ -4,8 +4,65 @@
 
 ## 1.28.2 (2026-11-25)
 
-> **只有文档。** 两件事：把 issue #2 的排查结论与被实测确认过的 workaround 收进新的
-> 排障文档，以及把 README 从 536 行裁到 375 行。
+> **一处修复 + 文档。** 修 issue #3 的三处目录缺陷（刷新后不通知客户端、只读 `chat` 桶、节点发现失败无退避）；README 裁剪并拆出排障文档，并把 issue #2 的排查结论收进新的排障文档。
+
+### 修复
+
+- **目录刷新后通知客户端（issue #3 原因 C）。** 这是本轮**影响面最大**的一条，且与
+  HungerG 无关。
+  - **现场**：卡片里能看到新模型，**DSH 的模型选择器里没有** —— 用户只能重启才看到
+    新目录。
+  - **根因**：客户端的选择器只在收到 `llm/adapters-updated` / `llm/models-updated`
+    时重拉目录，而插件刷新完只调 `invalidateCatalog()` —— 那是插件自己 adapter 的
+    `invalidate()`，只重建 `profiles` Map（`src/adapter.ts`），**不发任何事件**。
+  - **为什么之前没人发现**：`applySelection` 里确实有一次 `syncRegionRegistration`，
+    但它跑在适配器注册**之前**（那时 `registration[region].adapter` 还是
+    `undefined`，函数直接 `continue`）。所以启动路径也从未真正通知过。
+  - **改法**：`refreshRegionCatalog()` 末尾补 `syncRegionRegistration(config)`。宿主
+    侧对句柄 `replace()` 会 publish `llm/adapters-updated`（`dsh-llm` 源码注释：
+    *"`llm/adapters-updated` is published, so a `replace` announces itself"*），
+    适配器注册本身幂等，重复 replace 只为通知、不改状态。
+  - **测试**：`tests/index.spec.ts` 新增一条，直接数 `llm/adapters-updated` 事件；
+    **反向验证过** —— 去掉那一行，测试确实变红（`waitFor timeout`）。
+
+- **目录来源改为 `chat ∪ assistant ∪ app`（issue #3 原因 A）。**
+  - **现场**：`/model/list` 的响应不是模型数组，而是**按场景分的 12 个桶**；此前只读
+    `data.chat`，于是只出现在 `assistant` / `app` 里的模型（`hmodel` / HungerG）被
+    静默丢弃，没有任何报错。
+  - **实测**（ct=10）：`chat ⊆ assistant`、`chat ⊆ app`，两者都只多一个 `hmodel`；
+    `qwake` 与 `chat` 完全相同，其余桶都是 `chat` 的子集。所以并这三个桶恰好等于
+    「`chat` + 活动模型」，不会把 IDE / 团队的残缺列表（`qcode` 只有 3 条）混进来。
+  - **去重**：同 key 以**先出现者**为准（`chat` 排第一）。实测同一个 key 在不同桶里
+    内容不同（`context_config` / `is_default` / `tags` / `thinking_config`），让后出现
+    的桶覆盖会让价格与上下文档位随桶序漂移。
+  - **注意**：单修这一条**今天一个模型都不会多** —— ct=5 下三个桶是同集，只有换通道
+    才会有差集。它是"读取逻辑不再依赖只取 chat 这个隐含假设"，不是"放开活动模型"。
+
+- **新增 `regions.<region>.catalogChannel`（默认 `cli`），只作用于目录请求。**
+  - `desktop` 才会向 `/model/list` 发 `cosy-clienttype: 10`，从而拿到活动模型。
+  - **聊天请求永远是 CLI 通道**。实测 ct=10 会让上游换一套推理与截断行为：同一请求
+    （`isReasoning:false`、`maxOutputTokens:24`）在 ct=5 下产出 4 token / 0 reasoning，
+    在 ct=10 下变成 71 / 67，**连输出上限都没被遵守**。那不是我们要的对话行为。
+  - **签名不受影响**：签名材料是 `md5(payloadB64 \n cosyKey \n date \n body \n pathSig)`，
+    请求头不参与；payload 里也没有 clientType。实测 ct=5 / ct=10 都是 200。
+  - **渠道独有模型不自动勾选**：`initialEnabledKeys` 跳过 `channelOnly` 的模型，即使
+    上游写 `is_free: true`。理由是钱 —— 这类模型在部分套餐上由上游按普通模型计费
+    （`billable: true`），而插件没有请求前的判据（`billable` 只能事后从 SSE 读）。
+    自动勾选等于替用户做花钱的决定，去掉之后就降级成「看得见、要点一次」。
+  - **不猜套餐**：插件里只有 `planExpiresAtMs`（套餐到期时刻），没有任何 tier / Team
+    标记。用未验证字段去支撑有钱包后果的决策，比不做更糟。
+
+- **节点发现失败补退避（issue #3 附带发现）。**
+  - 现场：`/api/v3/service/region/endpoints` 对部分账号 404。发现失败本身安全（退回
+    默认网关），但 `isFresh()` 只在**成功**时为真 —— 于是一个 404 会让**每个请求**都
+    重打一次发现（`discoverNodes` 在 `chatStream` 与 `fetchModels` 里各调一次），等于
+    每回合多一次往返、多一条 warn。
+  - 改法：`QoderEndpointCache` 加失败冷却（60 秒），成功写入或 `clear()` 时解除。
+
+- **实测记录（上面所有取舍的依据）**：同一账号、只改 `/model/list` 的
+  `cosy-clienttype`：`assistant` 与 `app` 各 14 → 15，新增的正是 `hmodel`
+  （`HungerG`，`is_free: true`、`price_factor: 0`），其余 10 个桶长度**分毫不变**；
+  两次独立会话结果一致。
 
 ### 文档
 
